@@ -1,0 +1,13 @@
+## Interface: 11507
+## Title: WoWFAH
+## Notes: Manual auction house snapshot dump for offline analysis
+## Author: Jordan Speizer
+## Version: 0.1.0
+## SavedVariables: WoWFAH_DB
+
+# The Interface number is a placeholder until the WoW Forever client build is known.
+# If the client reports the addon as out of date, update it (or tick "Load out of date AddOns").
+
+Core.lua
+Adapters.lua
+Scan.lua
