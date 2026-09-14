@@ -1,96 +1,127 @@
 local _, ns = ...
 
--- Each adapter exposes the same interface:
---   Available()        -> bool, whether this client has the API
---   CanQueryAll()      -> ok, reason
---   QueryAll()         -> requests a full snapshot; listEvent fires when ready
---   GetNumItems()      -> number of auctions in the snapshot
---   ReadRow(i)         -> packedRow or nil, complete (i is 1-based)
+-- Each adapter searches one item at a time, a page at a time:
+--   Available()                    -> bool, whether this client has the API
+--   events                         -> events that may carry search results
+--   IsReady()                      -> bool, whether the server accepts a query now
+--   Query(item, page)              -> sends the search for page (0-based)
+--   Matches(item, event, ...)      -> bool, whether the event answers the pending query
+--   ReadPage(item, event)          -> hasMore, notCommodity
+-- ReadPage records results with ns.AddListing / ns.AddBidOnly and may set
+-- item.reportedListings (total the server says exists) and item.unreadable.
 ns.adapters = {}
 
-local function itemStringFromLink(link)
-    if not link then
-        return nil
-    end
-    return link:match("|H(item:[^|]+)|h")
-end
-
-local function buildRow(itemId, link, name, count, quality, level, minBid, minIncrement,
-                        buyout, bidAmount, highBidder, owner, timeLeft, saleStatus, hasAllInfo)
-    if not itemId then
-        return nil, false
-    end
-    local complete = (hasAllInfo and link ~= nil and name ~= nil) and true or false
-    local itemString = itemStringFromLink(link) or ("item:" .. itemId)
-    return ns.PackRow({
-        itemId, itemString, name, count, quality, level,
-        minBid, minIncrement, buyout, bidAmount, highBidder and 1 or 0,
-        owner, timeLeft, saleStatus, complete and 1 or 0,
-    }), complete
-end
-
--- Classic Era style: QueryAuctionItems with getAll.
-local Classic = { name = "classic", listEvent = "AUCTION_ITEM_LIST_UPDATE" }
+-- Classic Era style: QueryAuctionItems by exact name, 50 auctions per page.
+local Classic = { name = "classic", events = { "AUCTION_ITEM_LIST_UPDATE" } }
 ns.adapters.classic = Classic
 
 function Classic.Available()
     return type(QueryAuctionItems) == "function" and type(GetAuctionItemInfo) == "function"
 end
 
-function Classic:CanQueryAll()
-    local _, canQueryAll = CanSendAuctionQuery()
-    if canQueryAll then
-        return true
-    end
-    return false, "full scan not available yet (the server allows one every ~15 minutes)"
+function Classic:IsReady()
+    return (CanSendAuctionQuery()) and true or false
 end
 
-function Classic:QueryAll()
-    QueryAuctionItems("", nil, nil, 0, nil, nil, true, false, nil)
+function Classic:Query(item, page)
+    -- text, minLevel, maxLevel, page, usable, rarity, getAll, exactMatch, filterData
+    QueryAuctionItems(item.entry.name, nil, nil, page, false, nil, false, true, nil)
 end
 
-function Classic:GetNumItems()
-    local batch = GetNumAuctionItems("list")
-    return batch or 0
-end
-
-function Classic:ReadRow(i)
-    local name, _, count, quality, _, level, _, minBid, minIncrement, buyout, bidAmount,
-        highBidder, _, owner, ownerFullName, saleStatus, itemId, hasAllInfo = GetAuctionItemInfo("list", i)
-    return buildRow(itemId, GetAuctionItemLink("list", i), name, count, quality, level,
-        minBid, minIncrement, buyout, bidAmount, highBidder, ownerFullName or owner,
-        GetAuctionItemTimeLeft("list", i), saleStatus, hasAllInfo)
-end
-
--- Modern C_AuctionHouse style: ReplicateItems (0-based indices).
-local Modern = { name = "modern", listEvent = "REPLICATE_ITEM_LIST_UPDATE" }
-ns.adapters.modern = Modern
-
-function Modern.Available()
-    return type(C_AuctionHouse) == "table" and type(C_AuctionHouse.ReplicateItems) == "function"
-end
-
-function Modern:CanQueryAll()
-    -- No client-side throttle query exists; the server silently rate limits.
+function Classic:Matches()
     return true
 end
 
-function Modern:QueryAll()
-    C_AuctionHouse.ReplicateItems()
+function Classic:ReadPage(item)
+    local perPage = NUM_AUCTION_ITEMS_PER_PAGE or 50
+    local batch, total = GetNumAuctionItems("list")
+    batch, total = batch or 0, total or 0
+    item.reportedListings = total
+    local wanted = item.entry.itemId
+    for i = 1, batch do
+        local _, _, count, _, _, _, _, _, _, buyout, _, _, _, _, _, _, itemId = GetAuctionItemInfo("list", i)
+        if not itemId then
+            item.unreadable = item.unreadable + 1
+        elseif itemId == wanted then -- exact name search can still return same-named items
+            count = count or 1
+            if buyout and buyout > 0 then
+                ns.AddListing(item, math.floor(buyout / count + 0.5), count,
+                    GetAuctionItemTimeLeft("list", i) or 0, count)
+            else
+                ns.AddBidOnly(item, count)
+            end
+        end
+    end
+    return batch > 0 and (item.pagesRead + 1) * perPage < total, false
 end
 
-function Modern:GetNumItems()
-    return C_AuctionHouse.GetNumReplicateItems() or 0
+-- Modern C_AuctionHouse style: commodity search, more results on request.
+local Modern = {
+    name = "modern",
+    events = { "COMMODITY_SEARCH_RESULTS_UPDATED", "COMMODITY_SEARCH_RESULTS_ADDED", "ITEM_SEARCH_RESULTS_UPDATED" },
+}
+ns.adapters.modern = Modern
+
+function Modern.Available()
+    return type(C_AuctionHouse) == "table" and type(C_AuctionHouse.SendSearchQuery) == "function"
 end
 
-function Modern:ReadRow(i)
-    local index = i - 1
-    local name, _, count, quality, _, level, _, minBid, minIncrement, buyout, bidAmount,
-        highBidder, _, owner, ownerFullName, saleStatus, itemId, hasAllInfo =
-        C_AuctionHouse.GetReplicateItemInfo(index)
-    return buildRow(itemId, C_AuctionHouse.GetReplicateItemLink(index), name, count, quality, level,
-        minBid, minIncrement, buyout, bidAmount, highBidder, ownerFullName or owner,
-        C_AuctionHouse.GetReplicateItemTimeLeft(index), saleStatus, hasAllInfo)
+function Modern:IsReady()
+    local ready = C_AuctionHouse.IsThrottledMessageSystemReady
+    return ready == nil or ready() and true or false
+end
+
+function Modern:Query(item, page)
+    local itemId = item.entry.itemId
+    if page == 0 then
+        item.read = 0
+        C_AuctionHouse.SendSearchQuery(C_AuctionHouse.MakeItemKey(itemId), {}, false)
+    else
+        C_AuctionHouse.RequestMoreCommoditySearchResults(itemId)
+    end
+end
+
+function Modern:Matches(item, event, arg)
+    if event == "ITEM_SEARCH_RESULTS_UPDATED" then
+        return type(arg) == "table" and arg.itemID == item.entry.itemId
+    end
+    return arg == item.entry.itemId
+end
+
+-- Seconds -> the classic time left buckets used across the pipeline.
+local function timeLeftBucket(seconds)
+    if not seconds then
+        return 0
+    elseif seconds < 30 * 60 then
+        return 1
+    elseif seconds < 2 * 3600 then
+        return 2
+    elseif seconds < 12 * 3600 then
+        return 3
+    end
+    return 4
+end
+ns.TimeLeftBucket = timeLeftBucket
+
+function Modern:ReadPage(item, event)
+    if event == "ITEM_SEARCH_RESULTS_UPDATED" then
+        return false, true
+    end
+    local itemId = item.entry.itemId
+    local n = C_AuctionHouse.GetNumCommoditySearchResults(itemId) or 0
+    local before = item.read or 0
+    for i = before + 1, n do
+        local r = C_AuctionHouse.GetCommoditySearchResultInfo(itemId, i)
+        if r and r.unitPrice then
+            ns.AddListing(item, r.unitPrice, 0, timeLeftBucket(r.timeLeftSeconds), r.quantity or 0)
+        else
+            item.unreadable = item.unreadable + 1
+        end
+    end
+    item.read = n
+    -- Stop if a request for more returned nothing new, so a stuck server can't loop forever.
+    local progressed = n > before or item.pagesRead == 0
+    return progressed and not C_AuctionHouse.HasFullCommoditySearchResults(itemId), false
 end
 
 function ns.DetectAdapter()

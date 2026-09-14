@@ -1,0 +1,223 @@
+# Commodities the addon scans. Edit this file, then run `wowfah watchlist export`.
+# category: one word, usable as `/wowfah scan <category>`. bracket: level range where demand starts.
+# tags: ;-separated (leveling = demand fades as players outlevel it, raid = endgame demand, pvp).
+item_id,name,category,bracket,tags
+2447,Peacebloom,herb,1-20,leveling
+765,Silverleaf,herb,1-20,leveling
+2449,Earthroot,herb,1-20,leveling
+785,Mageroyal,herb,1-20,leveling
+2450,Briarthorn,herb,1-20,leveling
+2452,Swiftthistle,herb,1-20,leveling
+3820,Stranglekelp,herb,20-35,leveling
+2453,Bruiseweed,herb,20-35,leveling
+3355,Wild Steelbloom,herb,20-35,leveling
+3369,Grave Moss,herb,20-35,leveling
+3356,Kingsblood,herb,20-35,leveling
+3357,Liferoot,herb,20-35,leveling
+3818,Fadeleaf,herb,35-45,
+3821,Goldthorn,herb,35-45,
+3358,Khadgar's Whisker,herb,35-45,
+3819,Wintersbite,herb,35-45,
+8153,Wildvine,herb,35-45,
+4625,Firebloom,herb,45-55,
+8831,Purple Lotus,herb,45-55,
+8836,Arthas' Tears,herb,45-55,
+8838,Sungrass,herb,45-55,
+8839,Blindweed,herb,45-55,
+8845,Ghost Mushroom,herb,45-55,
+8846,Gromsblood,herb,45-55,
+13464,Golden Sansam,herb,55-60,raid
+13463,Dreamfoil,herb,55-60,raid
+13465,Mountain Silversage,herb,55-60,raid
+13466,Plaguebloom,herb,55-60,raid
+13467,Icecap,herb,55-60,raid
+13468,Black Lotus,herb,55-60,raid
+2770,Copper Ore,ore,1-20,leveling
+2771,Tin Ore,ore,1-20,leveling
+2775,Silver Ore,ore,1-20,leveling
+2772,Iron Ore,ore,20-35,leveling
+2776,Gold Ore,ore,20-35,leveling
+3858,Mithril Ore,ore,35-45,
+7911,Truesilver Ore,ore,35-45,
+10620,Thorium Ore,ore,55-60,raid
+11370,Dark Iron Ore,ore,55-60,raid
+2840,Copper Bar,bar,1-20,leveling
+3576,Tin Bar,bar,1-20,leveling
+2841,Bronze Bar,bar,1-20,leveling
+2842,Silver Bar,bar,1-20,leveling
+3575,Iron Bar,bar,20-35,leveling
+3859,Steel Bar,bar,20-35,leveling
+3577,Gold Bar,bar,20-35,leveling
+3860,Mithril Bar,bar,35-45,
+6037,Truesilver Bar,bar,35-45,
+12359,Thorium Bar,bar,55-60,raid
+11371,Dark Iron Bar,bar,55-60,raid
+12360,Arcanite Bar,bar,55-60,raid
+12655,Enchanted Thorium Bar,bar,55-60,raid
+2835,Rough Stone,stone,1-45,leveling
+2836,Coarse Stone,stone,1-45,leveling
+2838,Heavy Stone,stone,1-45,leveling
+7912,Solid Stone,stone,1-45,leveling
+12365,Dense Stone,stone,55-60,
+818,Tigerseye,gem,20-45,
+774,Malachite,gem,20-45,
+1210,Shadowgem,gem,20-45,
+1206,Moss Agate,gem,20-45,
+1705,Lesser Moonstone,gem,20-45,
+1529,Jade,gem,20-45,
+3864,Citrine,gem,20-45,
+7909,Aquamarine,gem,20-45,
+7910,Star Ruby,gem,55-60,raid
+12361,Blue Sapphire,gem,55-60,raid
+12799,Large Opal,gem,55-60,raid
+12364,Huge Emerald,gem,55-60,raid
+12800,Azerothian Diamond,gem,55-60,raid
+12363,Arcane Crystal,gem,55-60,raid
+4611,Blue Pearl,gem,35-60,
+7971,Black Pearl,gem,35-60,
+13926,Golden Pearl,gem,35-60,
+5500,Iridescent Pearl,gem,35-60,
+2589,Linen Cloth,cloth,1-20,leveling
+2996,Bolt of Linen Cloth,cloth,1-20,leveling
+2592,Wool Cloth,cloth,20-35,leveling
+2997,Bolt of Woolen Cloth,cloth,20-35,leveling
+4306,Silk Cloth,cloth,20-35,leveling
+4305,Bolt of Silk Cloth,cloth,20-35,leveling
+4338,Mageweave Cloth,cloth,35-45,
+4339,Bolt of Mageweave,cloth,35-45,
+14047,Runecloth,cloth,55-60,raid
+14048,Bolt of Runecloth,cloth,55-60,raid
+14256,Felcloth,cloth,55-60,raid
+14342,Mooncloth,cloth,55-60,raid
+2934,Ruined Leather Scraps,leather,1-20,leveling
+2318,Light Leather,leather,1-20,leveling
+783,Light Hide,leather,1-20,leveling
+2319,Medium Leather,leather,20-35,leveling
+4232,Medium Hide,leather,20-35,leveling
+4234,Heavy Leather,leather,20-35,leveling
+4235,Heavy Hide,leather,20-35,leveling
+4304,Thick Leather,leather,35-45,
+8169,Thick Hide,leather,35-45,
+8165,Worn Dragonscale,leather,35-45,
+8170,Rugged Leather,leather,55-60,raid
+8171,Rugged Hide,leather,55-60,raid
+15407,Cured Rugged Hide,leather,55-60,raid
+12810,Enchanted Leather,leather,55-60,raid
+15417,Devilsaur Leather,leather,55-60,raid
+17012,Core Leather,leather,55-60,raid
+15416,Black Dragonscale,leather,55-60,raid
+15412,Green Dragonscale,leather,55-60,raid
+15415,Blue Dragonscale,leather,55-60,raid
+10940,Strange Dust,enchanting,1-20,leveling
+10938,Lesser Magic Essence,enchanting,1-20,leveling
+10939,Greater Magic Essence,enchanting,1-20,leveling
+10978,Small Glimmering Shard,enchanting,1-20,leveling
+11083,Soul Dust,enchanting,20-35,leveling
+10998,Lesser Astral Essence,enchanting,20-35,leveling
+11082,Greater Astral Essence,enchanting,20-35,leveling
+11084,Large Glimmering Shard,enchanting,20-35,leveling
+11138,Small Glowing Shard,enchanting,20-35,leveling
+11137,Vision Dust,enchanting,35-45,
+11134,Lesser Mystic Essence,enchanting,35-45,
+11135,Greater Mystic Essence,enchanting,35-45,
+11139,Large Glowing Shard,enchanting,35-45,
+11177,Small Radiant Shard,enchanting,35-45,
+11176,Dream Dust,enchanting,35-45,
+11174,Lesser Nether Essence,enchanting,35-45,
+11175,Greater Nether Essence,enchanting,35-45,
+11178,Large Radiant Shard,enchanting,35-45,
+16204,Illusion Dust,enchanting,55-60,raid
+16202,Lesser Eternal Essence,enchanting,55-60,raid
+16203,Greater Eternal Essence,enchanting,55-60,raid
+14343,Small Brilliant Shard,enchanting,55-60,raid
+14344,Large Brilliant Shard,enchanting,55-60,raid
+20725,Nexus Crystal,enchanting,55-60,raid
+7067,Elemental Earth,elemental,20-45,
+7068,Elemental Fire,elemental,20-45,
+7070,Elemental Water,elemental,20-45,
+7069,Elemental Air,elemental,20-45,
+7077,Heart of Fire,elemental,20-45,
+7075,Core of Earth,elemental,20-45,
+7079,Globe of Water,elemental,20-45,
+7081,Breath of Wind,elemental,20-45,
+7078,Essence of Fire,elemental,55-60,raid
+7076,Essence of Earth,elemental,55-60,raid
+7080,Essence of Water,elemental,55-60,raid
+7082,Essence of Air,elemental,55-60,raid
+12808,Essence of Undeath,elemental,55-60,raid
+12803,Living Essence,elemental,55-60,raid
+7972,Ichor of Undeath,elemental,55-60,raid
+12811,Righteous Orb,elemental,55-60,raid
+10286,Heart of the Wild,elemental,55-60,raid
+11382,Blood of the Mountain,elemental,55-60,raid
+17010,Fiery Core,elemental,55-60,raid
+17011,Lava Core,elemental,55-60,raid
+13759,Raw Nightfin Snapper,fish,35-60,
+13760,Raw Sunscale Salmon,fish,35-60,
+13422,Stonescale Eel,fish,35-60,
+6358,Oily Blackmouth,fish,35-60,
+6359,Firefin Snapper,fish,35-60,
+6522,Deviate Fish,fish,35-60,
+929,Healing Potion,potion,1-45,leveling
+1710,Greater Healing Potion,potion,1-45,leveling
+3928,Superior Healing Potion,potion,1-45,leveling
+3827,Mana Potion,potion,1-45,leveling
+6149,Greater Mana Potion,potion,1-45,leveling
+13443,Superior Mana Potion,potion,1-45,leveling
+2459,Swiftness Potion,potion,1-45,leveling
+3823,Lesser Invisibility Potion,potion,1-45,leveling
+5634,Free Action Potion,potion,45-60,pvp
+3387,Limited Invulnerability Potion,potion,45-60,pvp
+9030,Restorative Potion,potion,45-60,pvp
+9172,Invisibility Potion,potion,45-60,pvp
+13446,Major Healing Potion,potion,55-60,raid
+13444,Major Mana Potion,potion,55-60,raid
+13455,Greater Stoneshield Potion,potion,55-60,raid
+13442,Mighty Rage Potion,potion,55-60,raid
+5633,Great Rage Potion,potion,55-60,raid
+6049,Fire Protection Potion,potion,55-60,raid
+13457,Greater Fire Protection Potion,potion,55-60,raid
+13458,Greater Nature Protection Potion,potion,55-60,raid
+13456,Greater Frost Protection Potion,potion,55-60,raid
+13459,Greater Shadow Protection Potion,potion,55-60,raid
+13461,Greater Arcane Protection Potion,potion,55-60,raid
+9036,Magic Resistance Potion,potion,55-60,raid
+20004,Major Troll's Blood Potion,potion,55-60,raid
+8949,Elixir of Agility,elixir,20-45,leveling
+8951,Elixir of Greater Defense,elixir,20-45,leveling
+9155,Arcane Elixir,elixir,20-45,leveling
+3825,Elixir of Fortitude,elixir,20-45,leveling
+13452,Elixir of the Mongoose,elixir,55-60,raid
+9206,Elixir of Giants,elixir,55-60,raid
+13453,Elixir of Brute Force,elixir,55-60,raid
+9187,Elixir of Greater Agility,elixir,55-60,raid
+13454,Greater Arcane Elixir,elixir,55-60,raid
+9264,Elixir of Shadow Power,elixir,55-60,raid
+21546,Elixir of Greater Firepower,elixir,55-60,raid
+17708,Elixir of Frost Power,elixir,55-60,raid
+13445,Elixir of Superior Defense,elixir,55-60,raid
+20007,Mageblood Potion,elixir,55-60,raid
+9088,Gift of Arthas,elixir,55-60,raid
+13510,Flask of the Titans,flask,55-60,raid
+13512,Flask of Supreme Power,flask,55-60,raid
+13511,Flask of Distilled Wisdom,flask,55-60,raid
+13506,Flask of Petrification,flask,55-60,raid
+13513,Flask of Chromatic Resistance,flask,55-60,raid
+13931,Nightfin Soup,food,55-60,raid
+13928,Grilled Squid,food,55-60,raid
+20452,Smoked Desert Dumplings,food,55-60,raid
+18254,Runn Tum Tuber Surprise,food,55-60,raid
+21023,Dirge's Kickin' Chimaerok Chops,food,55-60,raid
+21217,Sagefish Delight,food,55-60,raid
+18045,Tender Wolf Steak,food,55-60,raid
+12218,Monster Omelet,food,55-60,raid
+12404,Dense Sharpening Stone,consumable,55-60,raid
+18262,Elemental Sharpening Stone,consumable,55-60,raid
+12643,Dense Weightstone,consumable,55-60,raid
+14530,Heavy Runecloth Bandage,consumable,55-60,raid
+12820,Winterfall Firewater,consumable,55-60,raid
+4390,Iron Grenade,engineering,35-60,pvp
+10507,Solid Dynamite,engineering,35-60,pvp
+18641,Dense Dynamite,engineering,35-60,pvp
+15993,Thorium Grenade,engineering,35-60,pvp
+10646,Goblin Sapper Charge,engineering,35-60,pvp

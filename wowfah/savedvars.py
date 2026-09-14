@@ -52,7 +52,7 @@ def load(path: str | Path) -> dict[str, Any]:
     return loads(text, f"@{path.name}")
 
 
-def _quote(s: str) -> str:
+def quote(s: str) -> str:
     escaped = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
     return f'"{escaped}"'
 
@@ -67,13 +67,13 @@ def _scalar(value: Any) -> str:
             raise ValueError(f"cannot serialize non-finite number {value!r}")
         return repr(value)
     if isinstance(value, str):
-        return _quote(value)
+        return quote(value)
     raise TypeError(f"cannot serialize {type(value).__name__}")
 
 
 def _key(key: Any) -> str:
     if isinstance(key, str):
-        return f"[{_quote(key)}]"
+        return f"[{quote(key)}]"
     if isinstance(key, int) and not isinstance(key, bool):
         return f"[{key}]"
     raise TypeError(f"unsupported table key {key!r}")

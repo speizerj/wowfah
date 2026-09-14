@@ -1,8 +1,9 @@
 """SavedVariables -> Parquet.
 
 Layout under the data directory:
-    auctions/<scan>.parquet   one file per scan
-    scans/<scan>.parquet      scan metadata; written last, so it marks the scan as ingested
+    ladder/<scan>.parquet       buyout price ladder rows, one file per scan
+    item_scans/<scan>.parquet   one row per watched item per scan
+    scans/<scan>.parquet        scan metadata; written last, so it marks the scan as ingested
 """
 
 from __future__ import annotations
@@ -16,66 +17,96 @@ from typing import Any
 import polars as pl
 
 from wowfah import savedvars
-from wowfah.schema import AUCTIONS_SCHEMA, ROW_FIELD_COLUMNS, SCANS_SCHEMA, SUPPORTED_SCHEMA_VERSION
+from wowfah.schema import (
+    ITEM_SCANS_SCHEMA,
+    LADDER_FIELD_COLUMNS,
+    LADDER_SCHEMA,
+    SCANS_SCHEMA,
+    SUPPORTED_SCHEMA_VERSION,
+)
 
 DB_VARIABLE = "WoWFAH_DB"
 SOURCE = "addon"
 FIELD_SEP = "\t"
-
-_BOOL_COLUMNS = {"high_bidder", "complete"}
 
 
 @dataclass(frozen=True)
 class ScanResult:
     scan_id: str
     status: str  # "written" or "skipped"
-    rows: int
+    items: int
+    ladder_rows: int
 
 
-def _ts(epoch_seconds: int) -> datetime:
-    return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc)
+def _ts(epoch_seconds: int | None) -> datetime | None:
+    return None if epoch_seconds is None else datetime.fromtimestamp(epoch_seconds, tz=timezone.utc)
 
 
 def scan_file_stem(scan_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", scan_id)
 
 
-def _rows_list(scan: dict[str, Any]) -> list[str]:
-    rows = scan.get("rows") or []
+def _as_list(value: Any) -> list:
     # An empty Lua table decodes as {}.
-    return [] if isinstance(rows, dict) else rows
+    return [] if not value or isinstance(value, dict) else value
 
 
-def auctions_frame(scan: dict[str, Any]) -> pl.DataFrame:
-    row_format: list[str] = scan["rowFormat"]
-    split = pl.DataFrame({"raw": _rows_list(scan)}, schema={"raw": pl.String}).select(
-        pl.col("raw").str.split(FIELD_SEP).alias("fields")
+def item_scans_frame(scan: dict[str, Any]) -> pl.DataFrame:
+    rows = [
+        {
+            "scan_id": scan["scanId"],
+            "realm": scan["realm"],
+            "faction": scan["faction"],
+            "item_id": item["itemId"],
+            "name": item.get("name"),
+            "status": item["status"],
+            "started_at": _ts(item.get("startedAt")),
+            "finished_at": _ts(item.get("finishedAt")),
+            "pages": item.get("pages"),
+            "reported_listings": item.get("reportedListings"),
+            "listings_read": item.get("listingsRead"),
+            "quantity": item.get("quantity"),
+            "bid_only_listings": item.get("bidOnlyListings"),
+            "bid_only_quantity": item.get("bidOnlyQuantity"),
+            "unreadable": item.get("unreadable"),
+        }
+        for item in _as_list(scan.get("items"))
+    ]
+    return pl.DataFrame(rows, schema=ITEM_SCANS_SCHEMA)
+
+
+def ladder_frame(scan: dict[str, Any]) -> pl.DataFrame:
+    ladder_format: list[str] = scan["ladderFormat"]
+    raw, item_ids, scanned_at = [], [], []
+    for item in _as_list(scan.get("items")):
+        rows = _as_list(item.get("ladder"))
+        raw += rows
+        item_ids += [item["itemId"]] * len(rows)
+        scanned_at += [_ts(item.get("startedAt") or scan["startedAt"])] * len(rows)
+
+    base = pl.DataFrame(
+        {"raw": raw, "item_id": item_ids, "scanned_at": scanned_at},
+        schema={"raw": pl.String, "item_id": pl.Int64, "scanned_at": LADDER_SCHEMA["scanned_at"]},
     )
-
+    fields = pl.col("raw").str.split(FIELD_SEP)
     field_exprs = []
-    for i, field in enumerate(row_format):
-        column = ROW_FIELD_COLUMNS.get(field)
+    for i, field in enumerate(ladder_format):
+        column = LADDER_FIELD_COLUMNS.get(field)
         if column is None:
             continue  # field from a newer addon we don't map yet
-        raw = pl.col("fields").list.get(i, null_on_oob=True)
-        value = pl.when(raw == "").then(None).otherwise(raw)
-        if column in _BOOL_COLUMNS:
-            value = value.cast(pl.Int8, strict=True).cast(pl.Boolean)
-        else:
-            value = value.cast(AUCTIONS_SCHEMA[column], strict=True)
-        field_exprs.append(value.alias(column))
+        value = fields.list.get(i, null_on_oob=True)
+        field_exprs.append(pl.when(value == "").then(None).otherwise(value).cast(LADDER_SCHEMA[column], strict=True)
+                           .alias(column))
 
-    meta = {
-        "scan_id": pl.lit(scan["scanId"], pl.String),
-        "source": pl.lit(SOURCE, pl.String),
-        "realm": pl.lit(scan["realm"], pl.String),
-        "faction": pl.lit(scan["faction"], pl.String),
-        "scanned_at": pl.lit(_ts(scan["startedAt"]), AUCTIONS_SCHEMA["scanned_at"]),
-    }
-    df = split.select(*field_exprs).with_columns(**meta)
+    df = base.with_columns(
+        *field_exprs,
+        scan_id=pl.lit(scan["scanId"], pl.String),
+        realm=pl.lit(scan["realm"], pl.String),
+        faction=pl.lit(scan["faction"], pl.String),
+    )
     return df.select(
         (pl.col(c) if c in df.columns else pl.lit(None)).cast(dtype).alias(c)
-        for c, dtype in AUCTIONS_SCHEMA.items()
+        for c, dtype in LADDER_SCHEMA.items()
     )
 
 
@@ -88,11 +119,12 @@ def scan_frame(scan: dict[str, Any], schema_version: int, ingested_at: datetime)
         "schema_version": schema_version,
         "realm": scan["realm"],
         "faction": scan["faction"],
+        "category": scan.get("category"),
+        "status": scan.get("status"),
         "started_at": _ts(scan["startedAt"]),
-        "finished_at": _ts(scan["finishedAt"]),
-        "listed": scan.get("listed"),
-        "row_count": scan.get("rowCount"),
-        "incomplete": scan.get("incomplete"),
+        "finished_at": _ts(scan.get("finishedAt")),
+        "items_requested": scan.get("itemsRequested"),
+        "items_scanned": scan.get("itemsScanned"),
         "ingested_at": ingested_at,
     }
     return pl.DataFrame([row], schema=SCANS_SCHEMA)
@@ -108,25 +140,25 @@ def _write_atomic(df: pl.DataFrame, path: Path) -> None:
 def ingest_db(db: dict[str, Any], data_dir: str | Path, *, force: bool = False) -> list[ScanResult]:
     data_dir = Path(data_dir)
     schema_version = db.get("schemaVersion")
-    if schema_version is None or schema_version > SUPPORTED_SCHEMA_VERSION:
-        raise ValueError(f"unsupported {DB_VARIABLE} schemaVersion {schema_version!r}")
+    if schema_version != SUPPORTED_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported {DB_VARIABLE} schemaVersion {schema_version!r} (expected {SUPPORTED_SCHEMA_VERSION})"
+        )
 
     ingested_at = datetime.now(timezone.utc)
-    scans = db.get("scans") or []
-    if isinstance(scans, dict):
-        scans = []
-
     results = []
-    for scan in scans:
+    for scan in _as_list(db.get("scans")):
         stem = scan_file_stem(scan["scanId"])
         scan_path = data_dir / "scans" / f"{stem}.parquet"
+        items = len(_as_list(scan.get("items")))
         if scan_path.exists() and not force:
-            results.append(ScanResult(scan["scanId"], "skipped", len(_rows_list(scan))))
+            results.append(ScanResult(scan["scanId"], "skipped", items, 0))
             continue
-        auctions = auctions_frame(scan)
-        _write_atomic(auctions, data_dir / "auctions" / f"{stem}.parquet")
+        ladder = ladder_frame(scan)
+        _write_atomic(ladder, data_dir / "ladder" / f"{stem}.parquet")
+        _write_atomic(item_scans_frame(scan), data_dir / "item_scans" / f"{stem}.parquet")
         _write_atomic(scan_frame(scan, schema_version, ingested_at), scan_path)
-        results.append(ScanResult(scan["scanId"], "written", auctions.height))
+        results.append(ScanResult(scan["scanId"], "written", items, ladder.height))
     return results
 
 

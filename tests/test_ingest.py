@@ -5,114 +5,127 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from wowfah.dummy import pack_row
-from wowfah.ingest import auctions_frame, ingest_db, ingest_savedvariables, scan_file_stem
-from wowfah.schema import AUCTIONS_SCHEMA, ROW_FORMAT, SCANS_SCHEMA
+from wowfah.dummy import pack
+from wowfah.ingest import ingest_db, ingest_savedvariables, item_scans_frame, ladder_frame, scan_file_stem
+from wowfah.schema import ITEM_SCANS_SCHEMA, LADDER_FORMAT, LADDER_SCHEMA, SCANS_SCHEMA
 
 
-def _scan(rows, row_format=None, **overrides):
+def _item(item_id=2589, ladder=None, **overrides):
+    item = {
+        "itemId": item_id,
+        "name": "Linen Cloth",
+        "status": "ok",
+        "startedAt": 1789646410,
+        "finishedAt": 1789646415,
+        "pages": 1,
+        "reportedListings": 3,
+        "listingsRead": 3,
+        "quantity": 40,
+        "bidOnlyListings": 0,
+        "bidOnlyQuantity": 0,
+        "unreadable": 0,
+        "ladder": ladder if ladder is not None else [],
+    }
+    item.update(overrides)
+    return item
+
+
+def _scan(items, ladder_format=None, **overrides):
     scan = {
         "scanId": "Pyrewood Village-Horde-1789646400",
-        "addonVersion": "0.1.0",
+        "addonVersion": "0.2.0",
         "api": "classic",
         "realm": "Pyrewood Village",
         "faction": "Horde",
+        "status": "complete",
         "startedAt": 1789646400,
         "finishedAt": 1789646460,
-        "listed": len(rows),
-        "rowCount": len(rows),
-        "incomplete": 0,
-        "rowFormat": row_format or list(ROW_FORMAT),
-        "rows": rows,
+        "itemsRequested": len(items),
+        "itemsScanned": len(items),
+        "ladderFormat": ladder_format or list(LADDER_FORMAT),
+        "items": items,
     }
     scan.update(overrides)
     return scan
 
 
-def test_ingest_writes_one_file_pair_per_scan(dummy_savedvariables: Path, dummy_db: dict, tmp_path: Path):
+def test_ingest_writes_one_file_set_per_scan(dummy_savedvariables: Path, dummy_db: dict, tmp_path: Path):
     out = tmp_path / "data"
     results = ingest_savedvariables(dummy_savedvariables, out)
 
     assert [r.status for r in results] == ["written"] * 3
-    assert len(list((out / "auctions").glob("*.parquet"))) == 3
-    assert len(list((out / "scans").glob("*.parquet"))) == 3
+    for sub in ("scans", "item_scans", "ladder"):
+        assert len(list((out / sub).glob("*.parquet"))) == 3
 
-    auctions = pl.read_parquet(out / "auctions" / "*.parquet")
+    ladder = pl.read_parquet(out / "ladder" / "*.parquet")
+    item_scans = pl.read_parquet(out / "item_scans" / "*.parquet")
     scans = pl.read_parquet(out / "scans" / "*.parquet")
-    assert auctions.schema == pl.Schema(AUCTIONS_SCHEMA)
+    assert ladder.schema == pl.Schema(LADDER_SCHEMA)
+    assert item_scans.schema == pl.Schema(ITEM_SCANS_SCHEMA)
     assert scans.schema == pl.Schema(SCANS_SCHEMA)
-    assert auctions.height == 1200
-    assert scans["row_count"].sum() == 1200
-    assert auctions["complete"].not_().sum() == sum(s["incomplete"] for s in dummy_db["scans"])
+
+    expected_rows = sum(len(i["ladder"]) for s in dummy_db["scans"] for i in s["items"])
+    assert ladder.height == sum(r.ladder_rows for r in results) == expected_rows
+    assert item_scans.height == 27
+    assert ladder["quantity"].sum() == item_scans["quantity"].sum()
 
 
 def test_reingest_is_idempotent(dummy_savedvariables: Path, tmp_path: Path):
     out = tmp_path / "data"
-    ingest_savedvariables(dummy_savedvariables, out)
+    first = ingest_savedvariables(dummy_savedvariables, out)
     again = ingest_savedvariables(dummy_savedvariables, out)
     assert [r.status for r in again] == ["skipped"] * 3
     forced = ingest_savedvariables(dummy_savedvariables, out, force=True)
     assert [r.status for r in forced] == ["written"] * 3
-    assert pl.read_parquet(out / "auctions" / "*.parquet").height == 1200
+    assert pl.read_parquet(out / "ladder" / "*.parquet").height == sum(r.ladder_rows for r in first)
 
 
-def test_row_decoding_types_and_nulls():
-    rows = [
-        pack_row([2589, "item:2589::::::::60:::::", "Linen Cloth", 20, 1, 5, 200, 0, 240, 0, False, "Stackz", 4, 0, True]),
-        pack_row([13468, "item:13468", None, 1, 1, 60, 90000, 5000, 0, 95000, True, None, 2, 0, False]),
-    ]
-    df = auctions_frame(_scan(rows))
-    assert df.row(0, named=True) | {"scanned_at": None} == {
-        "scan_id": "Pyrewood Village-Horde-1789646400",
-        "source": "addon",
-        "realm": "Pyrewood Village",
-        "faction": "Horde",
-        "scanned_at": None,
-        "item_id": 2589,
-        "item_string": "item:2589::::::::60:::::",
-        "name": "Linen Cloth",
-        "count": 20,
-        "quality": 1,
-        "item_level": 5,
-        "min_bid": 200,
-        "min_increment": 0,
-        "buyout": 240,
-        "bid_amount": 0,
-        "high_bidder": False,
-        "owner": "Stackz",
-        "time_left": 4,
-        "sale_status": 0,
-        "complete": True,
-    }
-    second = df.row(1, named=True)
-    assert second["name"] is None and second["owner"] is None
-    assert second["high_bidder"] is True and second["complete"] is False
-    assert df["scanned_at"][0].isoformat() == "2026-09-17T12:00:00+00:00"
+def test_ladder_decoding():
+    scan = _scan([
+        _item(ladder=[pack([10, 20, 4, 1, 20]), pack([12, 5, 1, 4, 20])]),
+        _item(13468, name="Black Lotus", ladder=[pack([250000, 0, 0, 2, 3])], startedAt=1789646430),
+    ])
+    rows = ladder_frame(scan).to_dicts()
+    assert [(r["item_id"], r["unit_price"], r["stack_size"], r["time_left"], r["listings"], r["quantity"])
+            for r in rows] == [(2589, 10, 20, 4, 1, 20), (2589, 12, 5, 1, 4, 20), (13468, 250000, 0, 0, 2, 3)]
+    assert rows[0]["scan_id"] == "Pyrewood Village-Horde-1789646400"
+    assert rows[0]["realm"] == "Pyrewood Village" and rows[0]["faction"] == "Horde"
+    assert rows[0]["scanned_at"].isoformat() == "2026-09-17T12:00:10+00:00"
+    assert rows[2]["scanned_at"].isoformat() == "2026-09-17T12:00:30+00:00"
 
 
-def test_row_format_order_is_respected_and_unknown_fields_ignored():
-    fmt = ["name", "itemId", "futureField", "count", "buyout"]
-    df = auctions_frame(_scan(["Silk Cloth\t4306\tsomething\t10\t800"], row_format=fmt))
+def test_ladder_format_order_is_respected_and_unknown_fields_ignored():
+    fmt = ["quantity", "unitPrice", "futureField", "timeLeft"]
+    df = ladder_frame(_scan([_item(ladder=["60\t15\tx\t3"])], ladder_format=fmt))
     row = df.row(0, named=True)
-    assert (row["name"], row["item_id"], row["count"], row["buyout"]) == ("Silk Cloth", 4306, 10, 800)
-    assert row["owner"] is None and row["min_bid"] is None
+    assert (row["quantity"], row["unit_price"], row["time_left"]) == (60, 15, 3)
+    assert row["stack_size"] is None and row["listings"] is None
 
 
-def test_empty_scan_rows_decode_as_empty_frame():
-    # An empty Lua table round-trips as {} rather than [].
-    df = auctions_frame(_scan({}))
-    assert df.height == 0
-    assert df.schema == pl.Schema(AUCTIONS_SCHEMA)
+def test_item_scans_keep_failed_items_and_missing_fields():
+    scan = _scan([_item(), _item(4306, name="Silk Cloth", status="timeout", reportedListings=None)])
+    df = item_scans_frame(scan)
+    assert df.schema == pl.Schema(ITEM_SCANS_SCHEMA)
+    assert df["status"].to_list() == ["ok", "timeout"]
+    assert df["reported_listings"].to_list() == [3, None]
+
+
+def test_empty_tables_decode_as_empty_frames():
+    # Empty Lua tables round-trip as {} rather than [].
+    assert ladder_frame(_scan({})).height == 0
+    assert ladder_frame(_scan([_item(ladder={})])).schema == pl.Schema(LADDER_SCHEMA)
+    assert item_scans_frame(_scan({})).height == 0
 
 
 def test_malformed_number_fails_loudly():
     with pytest.raises(pl.exceptions.InvalidOperationError):
-        auctions_frame(_scan([pack_row([2589, "item:2589", "Linen", "twenty"] + [None] * 11)]))
+        ladder_frame(_scan([_item(ladder=["ten\t20\t4\t1\t20"])]))
 
 
-def test_rejects_newer_schema_version(tmp_path: Path):
+@pytest.mark.parametrize("version", [None, 1, 99])
+def test_rejects_other_schema_versions(tmp_path: Path, version):
     with pytest.raises(ValueError, match="schemaVersion"):
-        ingest_db({"schemaVersion": 99, "scans": []}, tmp_path)
+        ingest_db({"schemaVersion": version, "scans": []}, tmp_path)
 
 
 def test_scan_file_stem_is_filesystem_safe():

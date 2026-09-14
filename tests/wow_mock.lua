@@ -1,6 +1,8 @@
 -- Minimal WoW client mock for running the addon under lupa.
--- Auctions are loaded into M.auctions by the Python harness; each auction may
--- set uncachedReads = N so its first N reads look like uncached item data.
+-- The Python harness loads auctions into M.auctions:
+--   { itemId, name, count, buyout, minBid, timeLeft, timeLeftSeconds, unreadable }
+-- Server behaviour knobs: listDelay, queryCooldown (throttle after each query),
+-- modernPageSize, nonCommodity[itemId], silentNames[name] (queries never answered).
 
 local M = {
     frames = {},
@@ -10,11 +12,16 @@ local M = {
     baseTime = 1789646400,
     messages = {},
     auctions = {},
-    queries = 0,
-    canQueryAll = true,
+    queryLog = {},
+    throttledUntil = 0,
+    throttleViolations = 0,
+    queryCooldown = 0.5,
     realm = "Dreamscythe",
     faction = "Alliance",
-    listDelay = 2,
+    listDelay = 0.2,
+    modernPageSize = 100,
+    nonCommodity = {},
+    silentNames = {},
 }
 WOWMOCK = M
 
@@ -73,55 +80,120 @@ DEFAULT_CHAT_FRAME = {
 }
 SlashCmdList = {}
 
-local function info(a)
-    if not a then
-        return nil
-    end
-    local cached = (a.uncachedReads or 0) <= 0
-    if not cached then
-        a.uncachedReads = a.uncachedReads - 1
-    end
-    local name = cached and a.name or nil
-    local owner = cached and a.owner or nil
-    return name, 136235, a.count, a.quality, true, a.level, "", a.minBid, a.minIncrement,
-        a.buyout, a.bidAmount, a.highBidder, nil, owner, nil, a.saleStatus, a.itemId, cached
+local function ready()
+    return M.now >= M.throttledUntil
 end
 
-local function link(a)
-    if not a or (a.uncachedReads or 0) > 0 then
-        return nil
+local function sendQuery(entry)
+    if not ready() then
+        M.throttleViolations = M.throttleViolations + 1
     end
-    return "|cffffffff|Hitem:" .. a.itemId .. "::::::::60:::::|h[" .. a.name .. "]|h|r"
+    M.throttledUntil = M.now + M.queryCooldown
+    M.queryLog[#M.queryLog + 1] = entry
+end
+
+local function answer(name, event, ...)
+    if M.silentNames[name] then
+        return
+    end
+    local args = { ... }
+    C_Timer.After(M.listDelay, function() M.fire(event, (table.unpack or unpack)(args)) end)
+end
+
+local function namesById(itemId)
+    for _, a in ipairs(M.auctions) do
+        if a.itemId == itemId then
+            return a.name
+        end
+    end
 end
 
 function M.installClassic()
-    function QueryAuctionItems(...)
-        M.queries = M.queries + 1
-        M.lastQuery = { ... }
-        C_Timer.After(M.listDelay, function() M.fire("AUCTION_ITEM_LIST_UPDATE") end)
+    NUM_AUCTION_ITEMS_PER_PAGE = 50
+    local results, page = {}, 0
+
+    function QueryAuctionItems(text, _, _, p, _, _, getAll, exactMatch)
+        sendQuery({ text = text, page = p, getAll = getAll, exactMatch = exactMatch })
+        results, page = {}, p
+        for _, a in ipairs(M.auctions) do
+            if (exactMatch and a.name == text) or (not exactMatch and a.name:find(text, 1, true)) then
+                results[#results + 1] = a
+            end
+        end
+        answer(text, "AUCTION_ITEM_LIST_UPDATE")
     end
-    function CanSendAuctionQuery() return true, M.canQueryAll end
-    function GetNumAuctionItems() return #M.auctions, #M.auctions end
-    function GetAuctionItemInfo(_, i) return info(M.auctions[i]) end
-    function GetAuctionItemLink(_, i) return link(M.auctions[i]) end
+    function CanSendAuctionQuery() return ready(), false end
+    function GetNumAuctionItems()
+        local batch = math.max(0, math.min(50, #results - page * 50))
+        return batch, #results
+    end
+    local function at(i)
+        return results[page * 50 + i]
+    end
+    function GetAuctionItemInfo(_, i)
+        local a = at(i)
+        if not a then
+            return nil
+        end
+        local itemId = (not a.unreadable) and a.itemId or nil
+        return a.name, 136235, a.count, 1, true, 1, "", a.minBid, 0, a.buyout, 0, false, nil,
+            "Seller", nil, 0, itemId, itemId ~= nil
+    end
     function GetAuctionItemTimeLeft(_, i)
-        local a = M.auctions[i]
+        local a = at(i)
         return a and a.timeLeft
     end
 end
 
 function M.installModern()
+    local loaded, rows = {}, {}
+
+    local function commodityRows(itemId)
+        local out = {}
+        for _, a in ipairs(M.auctions) do
+            if a.itemId == itemId and a.buyout > 0 then
+                out[#out + 1] = {
+                    itemID = itemId,
+                    quantity = a.count,
+                    unitPrice = math.floor(a.buyout / a.count + 0.5),
+                    timeLeftSeconds = a.timeLeftSeconds,
+                }
+            end
+        end
+        table.sort(out, function(x, y) return x.unitPrice < y.unitPrice end)
+        return out
+    end
+
     C_AuctionHouse = {
-        ReplicateItems = function()
-            M.queries = M.queries + 1
-            C_Timer.After(M.listDelay, function() M.fire("REPLICATE_ITEM_LIST_UPDATE") end)
+        MakeItemKey = function(itemId)
+            return { itemID = itemId, itemLevel = 0, itemSuffix = 0, battlePetSpeciesID = 0 }
         end,
-        GetNumReplicateItems = function() return #M.auctions end,
-        GetReplicateItemInfo = function(index) return info(M.auctions[index + 1]) end,
-        GetReplicateItemLink = function(index) return link(M.auctions[index + 1]) end,
-        GetReplicateItemTimeLeft = function(index)
-            local a = M.auctions[index + 1]
-            return a and a.timeLeft
+        IsThrottledMessageSystemReady = ready,
+        SendSearchQuery = function(itemKey, sorts, separateOwnerItems)
+            local itemId = itemKey.itemID
+            sendQuery({ itemId = itemId, kind = "search" })
+            local name = namesById(itemId)
+            if M.nonCommodity[itemId] then
+                return answer(name, "ITEM_SEARCH_RESULTS_UPDATED", itemKey)
+            end
+            rows[itemId] = commodityRows(itemId)
+            loaded[itemId] = math.min(M.modernPageSize, #rows[itemId])
+            answer(name, "COMMODITY_SEARCH_RESULTS_UPDATED", itemId)
+        end,
+        RequestMoreCommoditySearchResults = function(itemId)
+            sendQuery({ itemId = itemId, kind = "more" })
+            loaded[itemId] = math.min(loaded[itemId] + M.modernPageSize, #rows[itemId])
+            answer(namesById(itemId), "COMMODITY_SEARCH_RESULTS_ADDED", itemId)
+        end,
+        GetNumCommoditySearchResults = function(itemId) return loaded[itemId] or 0 end,
+        HasFullCommoditySearchResults = function(itemId)
+            return rows[itemId] ~= nil and loaded[itemId] >= #rows[itemId]
+        end,
+        GetCommoditySearchResultInfo = function(itemId, index)
+            if index > (loaded[itemId] or 0) then
+                return nil
+            end
+            return rows[itemId][index]
         end,
     }
 end

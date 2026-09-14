@@ -60,6 +60,9 @@ class WowClient:
     def set_auctions(self, auctions: list[dict[str, Any]]) -> None:
         self.mock.auctions = self.to_lua(auctions)
 
+    def set_watchlist(self, entries: list[tuple[int, str, str]]) -> None:
+        self.ns.WATCHLIST = self.to_lua([list(e) for e in entries])
+
     def fire(self, event: str, *args: Any) -> None:
         self.mock.fire(event, *args)
 

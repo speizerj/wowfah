@@ -11,7 +11,7 @@ from wowfah.ingest import ingest_savedvariables
 
 @pytest.fixture
 def dummy_db() -> dict:
-    return generate_db(seed=7, scans=3, auctions_per_scan=400, incomplete_rate=0.02)
+    return generate_db(seed=7, scans=3)
 
 
 @pytest.fixture

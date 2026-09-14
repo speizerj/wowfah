@@ -1,16 +1,12 @@
 local addonName, ns = ...
 
-ns.VERSION = "0.1.0"
-ns.SCHEMA_VERSION = 1
+ns.VERSION = "0.2.0"
+ns.SCHEMA_VERSION = 2
 
--- Column order for packed rows. Stored alongside every scan so the offline
--- pipeline can decode old scans after this list changes. Keep in sync with
--- wowfah/schema.py ROW_FORMAT.
-ns.ROW_FORMAT = {
-    "itemId", "itemString", "name", "count", "quality", "level",
-    "minBid", "minIncrement", "buyout", "bidAmount", "highBidder",
-    "owner", "timeLeft", "saleStatus", "complete",
-}
+-- Field order for packed ladder rows. Stored alongside every scan so the
+-- offline pipeline can decode old scans after this list changes. Keep in sync
+-- with wowfah/schema.py LADDER_FORMAT.
+ns.LADDER_FORMAT = { "unitPrice", "stackSize", "timeLeft", "listings", "quantity" }
 
 local FIELD_SEP = "\t"
 
@@ -18,11 +14,11 @@ function ns.Print(msg)
     DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99WoWFAH|r: " .. tostring(msg))
 end
 
--- Packs a row into one tab-separated string; nil becomes an empty field.
--- One string per auction keeps SavedVariables small and fast to load.
-function ns.PackRow(values)
+-- Packs values into one tab-separated string; nil becomes an empty field.
+-- One string per ladder row keeps SavedVariables small and fast to load.
+function ns.PackFields(values, n)
     local out = {}
-    for i = 1, #ns.ROW_FORMAT do
+    for i = 1, n do
         local v = values[i]
         if v == nil then
             out[i] = ""
@@ -43,9 +39,24 @@ end
 function ns.InitDB()
     WoWFAH_DB = WoWFAH_DB or {}
     local db = WoWFAH_DB
+    if db.schemaVersion ~= ns.SCHEMA_VERSION then
+        -- Scans from an older layout can't be ingested by the current pipeline.
+        db.scans = {}
+    end
     db.schemaVersion = ns.SCHEMA_VERSION
     db.scans = db.scans or {}
     return db
+end
+
+-- Watchlist entries matching a category, or all of them when category is empty.
+function ns.WatchlistFor(category)
+    local out = {}
+    for _, e in ipairs(ns.WATCHLIST or {}) do
+        if category == nil or category == "" or e[3] == category then
+            out[#out + 1] = { itemId = e[1], name = e[2], category = e[3] }
+        end
+    end
+    return out
 end
 
 -- Event dispatch: one handler per event.
@@ -65,11 +76,11 @@ end
 frame:SetScript("OnEvent", function(_, event, ...)
     local handler = handlers[event]
     if handler then
-        handler(...)
+        handler(event, ...)
     end
 end)
 
-ns.RegisterEvent("ADDON_LOADED", function(name)
+ns.RegisterEvent("ADDON_LOADED", function(_, name)
     if name ~= addonName then
         return
     end
@@ -90,18 +101,10 @@ ns.RegisterEvent("AUCTION_HOUSE_CLOSED", function()
     end
 end)
 
-local function countRows(db)
-    local rows = 0
-    for _, scan in ipairs(db.scans) do
-        rows = rows + (scan.rowCount or 0)
-    end
-    return rows
-end
-
 local commands = {}
 
-function commands.scan()
-    ns.Scan:Start()
+function commands.scan(category)
+    ns.Scan:Start(category)
 end
 
 function commands.abort()
@@ -112,12 +115,32 @@ function commands.abort()
     end
 end
 
+function commands.list()
+    local counts, order = {}, {}
+    for _, e in ipairs(ns.WATCHLIST or {}) do
+        if not counts[e[3]] then
+            order[#order + 1] = e[3]
+        end
+        counts[e[3]] = (counts[e[3]] or 0) + 1
+    end
+    local parts = {}
+    for _, c in ipairs(order) do
+        parts[#parts + 1] = string.format("%s (%d)", c, counts[c])
+    end
+    ns.Print(string.format("%d watched items: %s", #(ns.WATCHLIST or {}), table.concat(parts, ", ")))
+end
+
 function commands.status()
     local db = ns.InitDB()
-    ns.Print(string.format("%d stored scan(s), %d auction rows", #db.scans, countRows(db)))
+    local items = 0
+    for _, scan in ipairs(db.scans) do
+        items = items + (scan.itemsScanned or 0)
+    end
+    ns.Print(string.format("%d stored scan(s), %d item scans", #db.scans, items))
     local st = ns.Scan.state
-    if st then
-        ns.Print(string.format("scan running: phase=%s read=%d/%d", st.phase, (st.cursor or 1) - 1, st.total or 0))
+    if st and st.item then
+        ns.Print(string.format("scan running: item %d/%d %s, page %d",
+            st.index, #st.entries, st.item.entry.name, st.item.pagesRead + 1))
     end
 end
 
@@ -132,7 +155,7 @@ function commands.clear(arg)
 end
 
 function commands.help()
-    ns.Print("/wowfah scan | status | abort | clear")
+    ns.Print("/wowfah scan [category] | list | status | abort | clear")
 end
 
 SLASH_WOWFAH1 = "/wowfah"

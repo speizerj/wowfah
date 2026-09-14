@@ -3,16 +3,36 @@ local _, ns = ...
 local Scan = {}
 ns.Scan = Scan
 
-local CHUNK_SIZE = 1000      -- rows read per frame
-local MAX_RETRY_PASSES = 5   -- re-reads for rows whose item data wasn't cached
-local RETRY_DELAY = 1.0      -- seconds between retry passes
-local QUERY_TIMEOUT = 300    -- seconds to wait for the snapshot to arrive
+local READY_POLL = 0.1            -- seconds between throttle checks
+local PAGE_TIMEOUT = 30           -- seconds to wait for one page of results
+local MAX_CONSECUTIVE_TIMEOUTS = 3
+local MAX_PAGES = 5000            -- per item; a safety stop, not an expected depth
 
 function Scan:IsRunning()
     return self.state ~= nil
 end
 
-function Scan:Start()
+-- Ladder accumulation, called by adapters. Rows are keyed by price, stack size and time left.
+function ns.AddListing(item, unitPrice, stackSize, timeLeft, quantity)
+    local key = unitPrice .. "\t" .. stackSize .. "\t" .. timeLeft
+    local row = item.ladder[key]
+    if not row then
+        row = { unitPrice, stackSize, timeLeft, 0, 0 }
+        item.ladder[key] = row
+    end
+    row[4] = row[4] + 1
+    row[5] = row[5] + quantity
+    item.listingsRead = item.listingsRead + 1
+    item.quantity = item.quantity + quantity
+end
+
+function ns.AddBidOnly(item, quantity)
+    item.listingsRead = item.listingsRead + 1
+    item.bidOnlyListings = item.bidOnlyListings + 1
+    item.bidOnlyQuantity = item.bidOnlyQuantity + quantity
+end
+
+function Scan:Start(category)
     if self.state then
         return ns.Print("a scan is already running")
     end
@@ -23,130 +43,181 @@ function Scan:Start()
     if not adapter then
         return ns.Print(err)
     end
-    local ok, reason = adapter:CanQueryAll()
-    if not ok then
-        return ns.Print(reason)
+    local entries = ns.WatchlistFor(category)
+    if #entries == 0 then
+        return ns.Print(category ~= "" and ("no watched items in category " .. category) or "the watchlist is empty")
     end
 
     local st = {
         adapter = adapter,
-        phase = "query",
+        category = (category ~= "" and category) or nil,
+        entries = entries,
+        index = 0,
         startedAt = ns.Now(),
-        rows = {},
-        pending = {},
-        pass = 0,
+        items = {},
+        timeouts = 0,
+        seq = 0,
     }
     self.state = st
-
-    ns.RegisterEvent(adapter.listEvent, function()
-        self:OnListReady(st)
-    end)
-    C_Timer.After(QUERY_TIMEOUT, function()
-        if self.state == st and st.phase == "query" then
-            self:Abort("timed out waiting for auction data")
-        end
-    end)
-    adapter:QueryAll()
-    ns.Print(string.format("full scan requested (%s API); the client may freeze briefly", adapter.name))
-end
-
-function Scan:OnListReady(st)
-    if self.state ~= st or st.phase ~= "query" then
-        return
+    for _, event in ipairs(adapter.events) do
+        ns.RegisterEvent(event, function(...)
+            self:OnEvent(st, ...)
+        end)
     end
-    ns.UnregisterEvent(st.adapter.listEvent)
-    st.phase = "read"
-    st.total = st.adapter:GetNumItems()
-    st.cursor = 1
-    self:ReadChunk(st)
+    ns.Print(string.format("scanning %d item(s) at full depth (%s API); /wowfah abort to stop", #entries, adapter.name))
+    self:NextItem(st)
 end
 
-function Scan:ReadChunk(st)
+function Scan:NextItem(st)
+    st.index = st.index + 1
+    local entry = st.entries[st.index]
+    if not entry then
+        return self:Finish(st, "complete")
+    end
+    st.item = {
+        entry = entry,
+        startedAt = ns.Now(),
+        pagesRead = 0,
+        ladder = {},
+        listingsRead = 0,
+        quantity = 0,
+        bidOnlyListings = 0,
+        bidOnlyQuantity = 0,
+        unreadable = 0,
+    }
+    self:SendWhenReady(st)
+end
+
+function Scan:SendWhenReady(st)
     if self.state ~= st then
         return
     end
-    local last = math.min(st.cursor + CHUNK_SIZE - 1, st.total)
-    for i = st.cursor, last do
-        local row, complete = st.adapter:ReadRow(i)
-        st.rows[i] = row
-        if not complete then
-            st.pending[#st.pending + 1] = i
-        end
-    end
-    st.cursor = last + 1
-    if st.cursor <= st.total then
-        C_Timer.After(0, function()
-            self:ReadChunk(st)
+    if not st.adapter:IsReady() then
+        C_Timer.After(READY_POLL, function()
+            self:SendWhenReady(st)
         end)
-    else
-        self:RetryPending(st)
+        return
     end
-end
-
-function Scan:RetryPending(st)
-    if #st.pending == 0 or st.pass >= MAX_RETRY_PASSES then
-        return self:Finish(st)
-    end
-    st.pass = st.pass + 1
-    st.phase = "retry"
-    C_Timer.After(RETRY_DELAY, function()
-        if self.state ~= st then
-            return
+    st.seq = st.seq + 1
+    local seq = st.seq
+    st.waiting = seq
+    st.adapter:Query(st.item, st.item.pagesRead)
+    C_Timer.After(PAGE_TIMEOUT, function()
+        if self.state == st and st.waiting == seq then
+            self:OnTimeout(st)
         end
-        local stillPending = {}
-        for _, i in ipairs(st.pending) do
-            local row, complete = st.adapter:ReadRow(i)
-            if row then
-                st.rows[i] = row
-            end
-            if not complete then
-                stillPending[#stillPending + 1] = i
-            end
-        end
-        st.pending = stillPending
-        self:RetryPending(st)
     end)
 end
 
-function Scan:Finish(st)
+function Scan:OnEvent(st, event, ...)
+    if self.state ~= st or not st.waiting or not st.adapter:Matches(st.item, event, ...) then
+        return
+    end
+    st.waiting = nil
+    local item = st.item
+    local hasMore, notCommodity = st.adapter:ReadPage(item, event)
+    if notCommodity then
+        return self:FinishItem(st, "not_commodity")
+    end
+    item.pagesRead = item.pagesRead + 1
+    st.timeouts = 0
+    if hasMore and item.pagesRead < MAX_PAGES then
+        return self:SendWhenReady(st)
+    end
+    self:FinishItem(st, "ok")
+end
+
+function Scan:OnTimeout(st)
+    st.waiting = nil
+    st.timeouts = st.timeouts + 1
+    self:FinishItem(st, "timeout")
+end
+
+local function packLadder(ladder)
+    local rows = {}
+    for _, row in pairs(ladder) do
+        rows[#rows + 1] = row
+    end
+    table.sort(rows, function(a, b)
+        if a[1] ~= b[1] then return a[1] < b[1] end
+        if a[2] ~= b[2] then return a[2] < b[2] end
+        return a[3] < b[3]
+    end)
     local packed = {}
-    for i = 1, st.total do
-        local row = st.rows[i]
-        if row then
-            packed[#packed + 1] = row
-        end
+    for i, row in ipairs(rows) do
+        packed[i] = ns.PackFields(row, #ns.LADDER_FORMAT)
+    end
+    return packed
+end
+
+function Scan:FinishItem(st, status)
+    local item = st.item
+    st.item = nil
+    st.items[#st.items + 1] = {
+        itemId = item.entry.itemId,
+        name = item.entry.name,
+        status = status,
+        startedAt = item.startedAt,
+        finishedAt = ns.Now(),
+        pages = item.pagesRead,
+        reportedListings = item.reportedListings,
+        listingsRead = item.listingsRead,
+        quantity = item.quantity,
+        bidOnlyListings = item.bidOnlyListings,
+        bidOnlyQuantity = item.bidOnlyQuantity,
+        unreadable = item.unreadable,
+        ladder = packLadder(item.ladder),
+    }
+    if st.timeouts >= MAX_CONSECUTIVE_TIMEOUTS then
+        return self:Abort("the server stopped answering searches")
+    end
+    self:NextItem(st)
+end
+
+function Scan:Finish(st, status)
+    for _, event in ipairs(st.adapter.events) do
+        ns.UnregisterEvent(event)
+    end
+    self.state = nil
+    if #st.items == 0 then
+        return
     end
     local realm = GetRealmName()
     local faction = UnitFactionGroup("player")
     local db = ns.InitDB()
-    local scan = {
+    local failed = 0
+    for _, item in ipairs(st.items) do
+        if item.status ~= "ok" then
+            failed = failed + 1
+        end
+    end
+    db.scans[#db.scans + 1] = {
         scanId = string.format("%s-%s-%d", realm, faction, st.startedAt),
         addonVersion = ns.VERSION,
         api = st.adapter.name,
         realm = realm,
         faction = faction,
+        category = st.category,
+        status = status,
         startedAt = st.startedAt,
         finishedAt = ns.Now(),
-        listed = st.total,
-        rowCount = #packed,
-        incomplete = #st.pending,
-        rowFormat = ns.ROW_FORMAT,
-        rows = packed,
+        itemsRequested = #st.entries,
+        itemsScanned = #st.items,
+        ladderFormat = ns.LADDER_FORMAT,
+        items = st.items,
     }
-    db.scans[#db.scans + 1] = scan
-    self.state = nil
-    ns.Print(string.format("scan complete: %d auctions stored (%d incomplete); /reload or log out to save",
-        scan.rowCount, scan.incomplete))
+    ns.Print(string.format("scan %s: %d/%d item(s) stored (%d not ok); /reload or log out to save",
+        status, #st.items, #st.entries, failed))
 end
 
+-- Stops the scan. Items already finished are kept; the one in progress is dropped.
 function Scan:Abort(reason)
     local st = self.state
     if not st then
         return
     end
-    if st.phase == "query" then
-        ns.UnregisterEvent(st.adapter.listEvent)
-    end
-    self.state = nil
+    st.item = nil
+    st.waiting = nil
     ns.Print("scan aborted: " .. reason)
+    self:Finish(st, "aborted")
 end
