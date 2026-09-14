@@ -2,7 +2,8 @@
 -- The Python harness loads auctions into M.auctions:
 --   { itemId, name, count, buyout, minBid, timeLeft, timeLeftSeconds, unreadable }
 -- Server behaviour knobs: listDelay, queryCooldown (throttle after each query),
--- modernPageSize, nonCommodity[itemId], silentNames[name] (queries never answered).
+-- modernPageSize, nonCommodity[itemId], silentNames[name] (queries never answered),
+-- duplicateAnswers (every result event fires twice).
 
 local M = {
     frames = {},
@@ -71,6 +72,16 @@ function M.runTimers(maxSteps)
 end
 
 function GetServerTime() return M.baseTime + math.floor(M.now) end
+function GetTime() return 1000 + M.now end
+function GetBuildInfo() return "1.15.9", "69722", "Sep 1 2026", 11509 end
+function GetCurrentRegion() return 3 end
+function GetItemInfo(query)
+    for _, a in ipairs(M.auctions) do
+        if a.itemId == query or a.name == query then
+            return a.name, "|cffffffff|Hitem:" .. a.itemId .. "::::::::60:::::|h[" .. a.name .. "]|h|r"
+        end
+    end
+end
 function time() return GetServerTime() end
 function GetRealmName() return M.realm end
 function UnitFactionGroup() return M.faction, M.faction end
@@ -98,6 +109,9 @@ local function answer(name, event, ...)
     end
     local args = { ... }
     C_Timer.After(M.listDelay, function() M.fire(event, (table.unpack or unpack)(args)) end)
+    if M.duplicateAnswers then
+        C_Timer.After(M.listDelay * 2, function() M.fire(event, (table.unpack or unpack)(args)) end)
+    end
 end
 
 local function namesById(itemId)

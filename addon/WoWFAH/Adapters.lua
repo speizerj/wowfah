@@ -7,12 +7,14 @@ local _, ns = ...
 --   Query(item, page)              -> sends the search for page (0-based)
 --   Matches(item, event, ...)      -> bool, whether the event answers the pending query
 --   ReadPage(item, event)          -> hasMore, notCommodity
+--   DumpRows(item, event, limit)   -> raw API return values as strings, for probe logs
+--   pageSize                       -> listings per page when the API pages by count, else nil
 -- ReadPage records results with ns.AddListing / ns.AddBidOnly and may set
 -- item.reportedListings (total the server says exists) and item.unreadable.
 ns.adapters = {}
 
 -- Classic Era style: QueryAuctionItems by exact name, 50 auctions per page.
-local Classic = { name = "classic", events = { "AUCTION_ITEM_LIST_UPDATE" } }
+local Classic = { name = "classic", events = { "AUCTION_ITEM_LIST_UPDATE" }, pageSize = 50 }
 ns.adapters.classic = Classic
 
 function Classic.Available()
@@ -33,7 +35,7 @@ function Classic:Matches()
 end
 
 function Classic:ReadPage(item)
-    local perPage = NUM_AUCTION_ITEMS_PER_PAGE or 50
+    local perPage = NUM_AUCTION_ITEMS_PER_PAGE or self.pageSize
     local batch, total = GetNumAuctionItems("list")
     batch, total = batch or 0, total or 0
     item.reportedListings = total
@@ -53,6 +55,16 @@ function Classic:ReadPage(item)
         end
     end
     return batch > 0 and (item.pagesRead + 1) * perPage < total, false
+end
+
+function Classic:DumpRows(_, _, limit)
+    local batch, total = GetNumAuctionItems("list")
+    local lines = { "GetNumAuctionItems: " .. ns.Describe(batch, total) }
+    for i = 1, math.min(limit, batch or 0) do
+        lines[#lines + 1] = string.format("[%d] %s | timeLeft=%s", i, ns.Describe(GetAuctionItemInfo("list", i)),
+            tostring(GetAuctionItemTimeLeft("list", i)))
+    end
+    return lines
 end
 
 -- Modern C_AuctionHouse style: commodity search, more results on request.
@@ -122,6 +134,31 @@ function Modern:ReadPage(item, event)
     -- Stop if a request for more returned nothing new, so a stuck server can't loop forever.
     local progressed = n > before or item.pagesRead == 0
     return progressed and not C_AuctionHouse.HasFullCommoditySearchResults(itemId), false
+end
+
+function Modern:DumpRows(item, event, limit)
+    local itemId = item.entry.itemId
+    local lines = {}
+    if C_AuctionHouse.GetItemCommodityStatus then
+        lines[1] = "GetItemCommodityStatus: " .. ns.Describe(C_AuctionHouse.GetItemCommodityStatus(itemId))
+    end
+    if event == "ITEM_SEARCH_RESULTS_UPDATED" then
+        return lines
+    end
+    local n = C_AuctionHouse.GetNumCommoditySearchResults(itemId) or 0
+    lines[#lines + 1] = string.format("GetNumCommoditySearchResults: %d, HasFull: %s", n,
+        tostring(C_AuctionHouse.HasFullCommoditySearchResults(itemId)))
+    -- The new rows, plus index 0 and n + 1, which show whether results are 0- or 1-based.
+    local first = (item.read or 0) + 1
+    local indexes = { 0 }
+    for i = first, math.min(first + limit - 1, n) do
+        indexes[#indexes + 1] = i
+    end
+    indexes[#indexes + 1] = n + 1
+    for _, i in ipairs(indexes) do
+        lines[#lines + 1] = string.format("[%d] %s", i, ns.Describe(C_AuctionHouse.GetCommoditySearchResultInfo(itemId, i)))
+    end
+    return lines
 end
 
 function ns.DetectAdapter()

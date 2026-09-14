@@ -303,3 +303,109 @@ def test_end_to_end_addon_to_market_view(flavor: str, tmp_path: Path):
     }
     ladder = pl.read_parquet(tmp_path / "data" / "ladder" / "*.parquet")
     assert ladder.filter(pl.col("item_id") == LINEN.item_id)["quantity"].sum() == quantity[LINEN.item_id]
+
+
+def probe_log(client: WowClient, index: int = -1) -> list[str]:
+    return client.db["probes"][index]["log"]
+
+
+def test_probe_logs_environment_pages_and_raw_rows(tmp_path: Path, capsys):
+    client = open_client("classic", listings_for(LINEN, 260), [LINEN])
+    client.slash("probe linen cloth 2")
+    client.run_timers()
+
+    db = client.db
+    assert db["scans"] in ([], {}) and db["itemStats"] in ([], {})
+    [probe] = db["probes"]
+    assert probe["target"] == "Linen Cloth" and probe["api"] == "classic"
+    assert probe["itemStatus"] == "ok" and probe["pages"] == 2 and probe["reportedListings"] == 260
+    assert [q["page"] for q in savedvars.lua_to_python(client.mock.queryLog)] == [0, 1]
+
+    log = "\n".join(probe["log"])
+    assert 'build: "1.15.9", "69722", "Sep 1 2026", 11509' in log
+    assert "globals: QueryAuctionItems=function" in log and "C_AuctionHouse: nil" in log
+    assert "GetNumAuctionItems: 50, 260" in log
+    assert '[1] "Linen Cloth", 136235, ' in log
+    assert "answered after 0.200s" in log and "throttle cleared after" in log
+    assert "page read: 50 listing(s), 0 unreadable so far, reported total 260, more: true" in log
+    assert "[stray" not in log
+    assert any("probe complete: ok, 2 page(s), 100 listing(s) read" in m for m in client.messages)
+
+    sv = tmp_path / "WoWFAH.lua"
+    savedvars.dump({"WoWFAH_DB": db}, sv)
+    from wowfah.cli import main
+    assert main(["probes", str(sv)]) == 0
+    out = capsys.readouterr().out
+    assert "== probe Linen Cloth (classic API, complete): item ok, 2 page(s), 100 read, reported 260" in out
+    assert "GetNumAuctionItems: 50, 260" in out
+
+
+def test_probe_flags_duplicate_events():
+    client = open_client("classic", listings_for(LINEN, 60), [LINEN], duplicateAnswers=True)
+    client.slash("probe 2589")
+    client.run_timers()
+    log = probe_log(client)
+    strays = [line for line in log if "[stray" in line]
+    assert len(strays) == 2  # one duplicate per page
+    assert client.db["probes"][0]["listingsRead"] == 60
+
+
+def test_probe_modern_dumps_result_indexes():
+    client = open_client("modern", listings_for(LINEN, 30), [LINEN])
+    client.slash("probe Linen Cloth")
+    client.run_timers()
+    log = "\n".join(probe_log(client))
+    assert "C_AuctionHouse: GetCommoditySearchResultInfo" in log
+    assert "GetNumCommoditySearchResults: " in log and "HasFull: true" in log
+    assert "[0] nil" in log and "[1] {itemID=2589, quantity=" in log
+
+
+def test_probe_unknown_item_and_usage():
+    client = open_client("classic", listings_for(SILK, 5), [LINEN])
+    client.slash("probe")
+    client.slash("probe Nothing Here")
+    assert any("usage: /wowfah probe" in m for m in client.messages)
+    assert any("unknown item Nothing Here" in m for m in client.messages)
+    # Not watched, but in the client's item cache.
+    client.slash("probe Silk Cloth")
+    client.run_timers()
+    assert client.db["probes"][0]["target"] == "Silk Cloth"
+
+
+def test_only_recent_probes_are_kept():
+    client = open_client("classic", listings_for(LINEN, 5), [LINEN])
+    for _ in range(7):
+        client.slash("probe 2589 1")
+        client.run_timers()
+    assert len(client.db["probes"]) == 5
+
+
+def test_estimates_use_history_from_previous_scan():
+    linen = listings_for(LINEN, 260)  # 6 pages
+    client = open_client("classic", linen + listings_for(SILK, 80), [LINEN, SILK], queryCooldown=1.0)
+    client.slash("scan")
+    assert not any("roughly" in m for m in client.messages)  # no history yet
+    client.run_timers()
+    assert any("scan complete: 2/2 item(s) stored (0 not ok), 8 page(s) in" in m and "s/page" in m
+               for m in client.messages)
+    stats = client.db["itemStats"]
+    assert stats[LINEN.item_id]["pages"] == 6 and stats[SILK.item_id]["pages"] == 2
+    assert client.db["secPerPage"] > 0
+
+    client.slash("clear confirm")
+    client.slash("scan")
+    assert any("scanning 2 item(s) at full depth (classic API), roughly " in m for m in client.messages)
+    # Finish Linen's first page so the server's total is known.
+    while client.ns.Scan.state["item"]["pagesRead"] < 1:
+        client.run_timers(1)
+    client.slash("status")
+    progress = client.messages[-1]
+    assert "scan running: item 1/2 Linen Cloth, page 2/6, " in progress
+    assert " elapsed, ~" in progress and "left (" in progress and "s/page)" in progress
+
+
+def test_format_duration():
+    client = WowClient("classic")
+    client.load_addon()
+    fmt = client.ns.FormatDuration
+    assert [fmt(4.4), fmt(59.6), fmt(125), fmt(3600 * 2 + 61)] == ["4s", "1m00s", "2m05s", "2h01m"]

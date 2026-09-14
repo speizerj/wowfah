@@ -18,6 +18,26 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_probes(args: argparse.Namespace) -> int:
+    from wowfah import savedvars
+    from wowfah.ingest import DB_VARIABLE
+
+    db = savedvars.load(args.savedvariables).get(DB_VARIABLE) or {}
+    probes = db.get("probes") or []
+    if isinstance(probes, dict):
+        probes = []
+    if not probes:
+        print("no probe logs stored")
+        return 0
+    for p in probes:
+        print(f"== probe {p.get('target')} ({p.get('api')} API, {p.get('status')}): item {p.get('itemStatus')}, "
+              f"{p.get('pages')} page(s), {p.get('listingsRead')} read, reported {p.get('reportedListings')}")
+        log = p.get("log") or []
+        for line in [] if isinstance(log, dict) else log:
+            print(line)
+    return 0
+
+
 def cmd_dummy(args: argparse.Namespace) -> int:
     from wowfah import savedvars
     from wowfah.dummy import generate_db
@@ -96,6 +116,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     p.add_argument("--force", action="store_true", help="rewrite scans that were already ingested")
     p.set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser("probes", help="print probe logs stored by /wowfah probe")
+    p.add_argument("savedvariables", type=Path)
+    p.set_defaults(func=cmd_probes)
 
     p = sub.add_parser("dummy", help="write a fake SavedVariables file")
     p.add_argument("output", type=Path)

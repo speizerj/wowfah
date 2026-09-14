@@ -14,8 +14,9 @@ Copy `addon/WoWFAH` into `Interface/AddOns/`, then at the auction house run:
 | --- | --- |
 | `/wowfah scan` | scan every watched item at full depth (needs the AH window open) |
 | `/wowfah scan <category>` | scan one category, e.g. `/wowfah scan herb` |
+| `/wowfah probe <item> [pages]` | instrumented scan of one item (default 3 pages) that saves a diagnostic log instead of a scan |
 | `/wowfah list` | watched item counts per category |
-| `/wowfah status` | stored scans, plus progress of a running scan |
+| `/wowfah status` | stored scans, plus progress and time left for a running scan |
 | `/wowfah abort` | stop; items already finished are kept |
 | `/wowfah clear confirm` | delete stored scans (do this after ingesting) |
 
@@ -29,6 +30,16 @@ The addon picks its API at runtime:
 
 If a page gets no answer within 30s, that item is marked `timeout` and the scan moves on. Three timeouts in a row abort the scan. Closing the AH also aborts it, and in both cases the finished items are kept.
 
+**Time estimates.** After each scan the addon remembers every item's page count and the average seconds per page. `/wowfah scan` prints a rough duration once every item has history. `/wowfah status` shows the current page against the expected total, elapsed time, and time left. The estimate uses the server's reported total for the current item and last scan's page counts for the rest.
+
+**Probes.** `/wowfah probe Peacebloom` logs:
+- the client build, region, and which API functions exist
+- each query with its timing and throttle waits
+- every event with its arguments, including duplicate or late events, which are flagged `[stray]`
+- raw return values for the first rows of each page
+
+It keeps listening 3s after the last page to catch late events. The last 5 probe logs are kept. Print them with `wowfah probes path/to/WoWFAH.lua`.
+
 For each item, the stored ladder holds one row per `(unit price, stack size, time left)` with listing and unit counts. Bid-only auctions are counted separately. The `## Interface` number in the `.toc` is a placeholder until the client build is known.
 
 ## Pipeline
@@ -41,6 +52,7 @@ wowfah watchlist check                       # validate watchlist.csv ids and na
 wowfah watchlist export                      # write addon/WoWFAH/Watchlist.lua
 wowfah ingest path/to/WoWFAH.lua             # -> data/{scans,item_scans,ladder}/*.parquet
 wowfah sql "SELECT * FROM market LIMIT 20"
+wowfah probes path/to/WoWFAH.lua             # print /wowfah probe logs
 wowfah dummy /tmp/WoWFAH.lua --scans 4       # fake SavedVariables for experimenting
 ```
 
@@ -78,6 +90,8 @@ The column schema lives in `wowfah/schema.py`, and the addon's packed ladder ord
 It also fails if `Watchlist.lua` is out of date with `watchlist.csv`.
 
 ## To confirm in the beta
+
+Run `/wowfah probe Peacebloom 5`, then `/reload`, then `wowfah probes WoWFAH.lua`. That log answers most of these:
 
 - `.toc` Interface number, and which API flavor the client exposes.
 - Classic: real query delay, pages per item, and whether stray `AUCTION_ITEM_LIST_UPDATE` events cause a page to be read twice. Compare `listings_read` with `reported_listings`.
