@@ -7,7 +7,7 @@ name = "wowfah"
 version = "0.1.0"
 description = "Offline pipeline for WoW Forever auction house scans"
 requires-python = ">=3.10"
-dependencies = ["polars>=1.30", "duckdb>=1.2", "lupa>=2.4"]
+dependencies = ["polars>=1.30", "duckdb>=1.2", "lupa>=2.4", "numpy>=1.26"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

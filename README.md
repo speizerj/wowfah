@@ -53,6 +53,9 @@ wowfah watchlist export                      # write addon/WoWFAH/Watchlist.lua
 wowfah ingest path/to/WoWFAH.lua             # -> data/{scans,item_scans,ladder}/*.parquet
 wowfah sql "SELECT * FROM market LIMIT 20"
 wowfah probes path/to/WoWFAH.lua             # print /wowfah probe logs
+wowfah signals                               # BUY/SELL at the latest scan of each item
+wowfah backtest                              # forward returns + trade simulation over all scans
+wowfah simulate data-sim --seed 3            # synthetic launch economy to try signals on
 wowfah dummy /tmp/WoWFAH.lua --scans 4       # fake SavedVariables for experimenting
 ```
 
@@ -70,6 +73,65 @@ DuckDB views:
 - `items`, `watchlist`: item metadata (after `items import`) and `watchlist.csv`.
 
 The column schema lives in `wowfah/schema.py`, and the addon's packed ladder order (`ns.LADDER_FORMAT`) must match it. Each scan stores its own `ladderFormat`, so older scans still decode after the format changes.
+
+## Signals
+
+`wowfah signals` shows the latest scan of every item that has a signal (`--all` for every item). Each row has:
+- the reason
+- price (quantity-weighted p10 unit price) and the 14-day baseline (mature items only)
+- `vs_3d_pct` / `trend_3d_pct_day`: price against its 3-day median, and the trend before this scan (launch items; still shown for mature)
+- how many units a `--trade-gold` buy would get and at what average price. The fill takes only listings within 5% of the signal price and at most 10% of what's listed -- **only for mature BUY/SELL**. Launch-mode rows always show `null` here: they're not orders, see below.
+
+Each item is in one of two modes, depending on how much history it has, and the two modes speak in different voices on purpose:
+
+**Mature (14+ days of history) -- real trade instructions**, because they're just measuring what this item's own market already did:
+
+| Signal | When |
+| --- | --- |
+| BUY | price at least 20% under its 14-day median, supply at least 1.25x its median, the 7-day trend not collapsing, and a return to baseline clears the 5% AH cut by 10% or more |
+| SELL | price at least 20% over its 14-day median with supply under 0.85x |
+
+**Launch (under 14 days of history) -- descriptive tags, not orders.** There's no baseline yet, and the "prior" behind these tags is a guess from `watchlist.csv` (bracket, tags), not something learned from the item itself. So these are flagged for you to judge, not acted on: `wowfah signals` never shows a fill for them, and `wowfah backtest`'s trade simulation never trades them (it only trades mature BUY/SELL).
+
+| Tag | When |
+| --- | --- |
+| DIP | the watchlist prior says demand is rising, and price is at least 15% below its 3-day median while the trend before this scan wasn't falling |
+| SPIKE | price is 30% or more above its 3-day median |
+| FADE | the prior says demand has passed its peak, and price is trending down |
+
+**The launch prior** comes from `watchlist.csv`:
+- `leveling` items are "rising" until the median player passes the top of the bracket, then "fading".
+- `raid` and `pvp` items are rising until two weeks after the median player hits 60.
+- Untagged items have no prior.
+
+The pace is `--days-to-60` (default 40) and `--launch-date` (default: first scan). All thresholds live in `SignalConfig` in `wowfah/signals.py`.
+
+**`wowfah backtest`** reports two things:
+- The average 1/3/7-day return after each signal episode (including launch's DIP/SPIKE/FADE), compared with buying at any scan. This is how to check whether the descriptive tags are worth promoting to real signals later, without ever having traded on them.
+- A trade simulation, mature BUY/SELL only. It fills against the real ladder, takes profit once proceeds after the cut beat cost by 5%, exits on a SELL signal or after 7 days, sells 1% under the cheapest listing, and sells at most 20% of listed quantity per scan.
+
+**`wowfah simulate`** generates a synthetic launch economy:
+- leveling-population demand waves
+- bots from week 2, and ban waves
+- supply dumps
+- inflation
+- raid-night demand
+- persistent price shocks
+
+It writes the ingest layout plus `truth/` (fair prices, events).
+
+**Results on simulated data** (42 days, all 219 items, 5,000g capital, 250g per trade, 3 seeds each):
+
+| Price shock half-life | Mature BUY, 3-day return | Launch DIP, 3-day return (not traded) | Trade sim P&L | Win rate |
+| --- | --- | --- | --- | --- |
+| 0.5 days | +43–47% | +26–40% | +1,770 to +2,160g | 90% |
+| 1.5 days (default) | +48% | +36–46% | +1,360 to +1,850g | 88% |
+| 4 days | +47–53% | +41–54% | +1,220 to +1,710g | 86% |
+
+These numbers test the mechanics. They don't predict real profit.
+- **The simulator is built on the same story the signals assume:** supply gluts revert, and demand follows the leveling population.
+- **An early momentum version of launch BUY lost money** (−4 to −10% after 3 days) and was replaced by dip buying. That replacement was checked on held-out seeds, but it was still chosen by looking at simulated results.
+- **Once real scans exist,** run `wowfah backtest` on them before trusting any threshold.
 
 ## Tests
 

@@ -57,6 +57,86 @@ def cmd_sql(args: argparse.Namespace) -> int:
     return 0
 
 
+def _launch(value: str | None):
+    from datetime import datetime, timezone
+
+    return datetime.fromisoformat(value).replace(tzinfo=timezone.utc) if value else None
+
+
+def _signal_config(args: argparse.Namespace):
+    from wowfah.signals import SignalConfig
+
+    return SignalConfig(launch_days_to_60=args.days_to_60)
+
+
+def cmd_simulate(args: argparse.Namespace) -> int:
+    from wowfah.simulate import SimConfig, simulate, write
+
+    cfg = SimConfig(days=args.days, scans_per_day=args.scans_per_day, seed=args.seed, depth_scale=args.depth_scale,
+                    categories=tuple(args.categories.split(",")) if args.categories else None)
+    frames = simulate(cfg)
+    write(frames, args.data_dir)
+    meta = frames["meta"].row(0, named=True)
+    print(f"simulated {frames['scans'].height} scans of {frames['item_scans']['item_id'].n_unique()} items "
+          f"({frames['ladder'].height} ladder rows) -> {args.data_dir}; median player hits 60 on day "
+          f"{meta['days_to_60']:.0f}")
+    return 0
+
+
+def cmd_signals(args: argparse.Namespace) -> int:
+    import polars as pl
+
+    from wowfah import watchlist
+    from wowfah.signals import fetch_market, format_copper, ladder_frame, latest, signals
+
+    entries = watchlist.load()
+    sig = signals(fetch_market(args.data_dir), entries, _signal_config(args), _launch(args.launch_date))
+    table = latest(sig, ladder_frame(args.data_dir), entries, args.trade_gold, include_quiet=args.all)
+    if table.height == 0:
+        print("no signals at the latest scan")
+        return 0
+    money = ["price", "baseline_price", "avg_unit_price"]
+    out = table.with_columns(
+        pl.col("scanned_at").dt.strftime("%m-%d %H:%M"),
+        *[pl.col(c).map_elements(format_copper, return_dtype=pl.String) for c in money],
+        pl.col("quantity").cast(pl.Int64),
+        (pl.col("short_deviation") * 100).round(0).alias("vs_3d_pct"),
+        (pl.col("trend_3d") * 100).round(1).alias("trend_3d_pct_day"),
+    ).drop("short_deviation", "trend_3d").rename(
+        {"units": f"buy_units_{args.trade_gold:g}g", "avg_unit_price": "buy_avg"})
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=220, fmt_str_lengths=60, tbl_hide_dataframe_shape=True):
+        print(out)
+    return 0
+
+
+def cmd_backtest(args: argparse.Namespace) -> int:
+    import polars as pl
+
+    from wowfah import watchlist
+    from wowfah.backtest import TradeConfig, forward_returns, simulate_trades, summarize_returns
+    from wowfah.signals import fetch_market, ladder_frame, signals
+
+    cfg = _signal_config(args)
+    sig = signals(fetch_market(args.data_dir), watchlist.load(), cfg, _launch(args.launch_date))
+    tcfg = TradeConfig(capital_gold=args.capital_gold, trade_gold=args.trade_gold, max_hold_days=args.max_hold_days)
+    trades, summary = simulate_trades(sig, ladder_frame(args.data_dir), cfg, tcfg)
+    pct = [pl.col(c).mul(100).round(1) for c in ("mean_ret_1d", "mean_ret_3d", "mean_ret_7d", "hit_rate_3d")]
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=200, tbl_hide_dataframe_shape=True):
+        print("Forward returns after each signal episode, % (after the AH cut for buys):")
+        print(summarize_returns(forward_returns(sig, cfg)).with_columns(pct))
+        print(f"\nTrade simulation: {tcfg}")
+        for k, v in summary.items():
+            print(f"  {k}: {v:.3f}" if isinstance(v, float) else f"  {k}: {v}")
+        if trades.height:
+            print(trades.group_by("mode", "exit_reason").agg(
+                trades=pl.len(), pnl_gold=(pl.col("pnl").sum() / 10_000).round(1),
+                avg_return_pct=(pl.col("return").mean() * 100).round(1),
+                win_rate_pct=((pl.col("pnl") > 0).mean() * 100).round(0),
+                avg_price_impact_pct=(pl.col("price_impact").mean() * 100).round(1),
+            ).sort("mode", "exit_reason"))
+    return 0
+
+
 def cmd_items_import(args: argparse.Namespace) -> int:
     from wowfah import items
     from wowfah.ingest import _write_atomic
@@ -133,6 +213,31 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     p.add_argument("--max-rows", type=int, default=40)
     p.set_defaults(func=cmd_sql)
+
+    p = sub.add_parser("simulate", help="write a synthetic launch economy (for developing signals)")
+    p.add_argument("data_dir", type=Path)
+    p.add_argument("--days", type=int, default=42)
+    p.add_argument("--scans-per-day", type=int, default=4)
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--depth-scale", type=float, default=1.0)
+    p.add_argument("--categories", help="comma-separated watchlist categories (default: all)")
+    p.set_defaults(func=cmd_simulate)
+
+    for name, func, help_ in [
+        ("signals", cmd_signals, "mature BUY/SELL and launch DIP/SPIKE/FADE at the latest scan of each item"),
+        ("backtest", cmd_backtest, "forward returns and a trade simulation over all scans"),
+    ]:
+        p = sub.add_parser(name, help=help_)
+        p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+        p.add_argument("--launch-date", help="YYYY-MM-DD (default: first scan)")
+        p.add_argument("--days-to-60", type=float, default=40.0, help="assumed days until the median player is 60")
+        p.add_argument("--trade-gold", type=float, default=100 if name == "signals" else 250)
+        if name == "signals":
+            p.add_argument("--all", action="store_true", help="include items without a signal")
+        else:
+            p.add_argument("--capital-gold", type=float, default=5000)
+            p.add_argument("--max-hold-days", type=float, default=7)
+        p.set_defaults(func=func)
 
     items_p = sub.add_parser("items", help="item metadata").add_subparsers(dest="items_command", required=True)
     p = items_p.add_parser("import", help="build data/items/items.parquet from wago.tools DB2 CSVs")
