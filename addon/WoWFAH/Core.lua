@@ -80,15 +80,31 @@ function ns.Describe(...)
     return table.concat(parts, ", ")
 end
 
+local function describeCall(ok, ...)
+    if not ok then
+        return "ERROR: " .. tostring((...))
+    end
+    return ns.Describe(...)
+end
+
+-- Calls fn(...) and describes the results, or the error if it throws. Probe logs poke at
+-- live API surface we've never seen before, so a signature we guessed wrong must never
+-- crash the probe -- it should show up as a line in the log instead.
+function ns.TryDescribe(fn, ...)
+    return describeCall(pcall(fn, ...))
+end
+
 -- Client facts the adapters depend on, for probe logs.
 function ns.Environment(adapter)
     local lines = { "addon " .. ns.VERSION .. ", adapter " .. adapter.name }
     if GetBuildInfo then
-        lines[#lines + 1] = "build: " .. ns.Describe(GetBuildInfo())
+        lines[#lines + 1] = "build: " .. ns.TryDescribe(GetBuildInfo)
     end
     lines[#lines + 1] = "realm/faction: " .. ns.Describe(GetRealmName(), UnitFactionGroup("player"))
     if GetCurrentRegion then
-        lines[#lines + 1] = "region: " .. ns.Describe(GetCurrentRegion(), GetCurrentRegionName and GetCurrentRegionName())
+        lines[#lines + 1] = "region: " .. ns.TryDescribe(function()
+            return GetCurrentRegion(), GetCurrentRegionName and GetCurrentRegionName()
+        end)
     end
     lines[#lines + 1] = "WOW_PROJECT_ID=" .. tostring(WOW_PROJECT_ID)
         .. " NUM_AUCTION_ITEMS_PER_PAGE=" .. tostring(NUM_AUCTION_ITEMS_PER_PAGE)
@@ -188,8 +204,18 @@ end)
 
 ns.ahOpen = false
 
+-- Tells the panel (UI.lua) something changed. Safe to call when there's no panel.
+function ns.Notify()
+    if ns.UI then
+        ns.UI:Refresh()
+    end
+end
+
 ns.RegisterEvent("AUCTION_HOUSE_SHOW", function()
     ns.ahOpen = true
+    if ns.UI then
+        ns.UI:Attach()
+    end
 end)
 
 ns.RegisterEvent("AUCTION_HOUSE_CLOSED", function()
@@ -197,13 +223,25 @@ ns.RegisterEvent("AUCTION_HOUSE_CLOSED", function()
     if ns.Scan:IsRunning() then
         ns.Scan:Abort("auction house closed")
     end
+    ns.Notify()
 end)
 
 local commands = {}
 
-function commands.scan(category)
+-- /wowfah scan [category] [maxPages] -- e.g. "cloth", "cloth 3", or just "3" for all items.
+-- maxPages caps how many pages ReadPage walks per item; a commodity market that never
+-- finishes (many price tiers, a slow/throttled server) would otherwise page forever.
+function commands.scan(arg)
+    local category, pages = arg:match("^(.-)%s+(%d+)$")
+    if not category then
+        if arg:match("^%d+$") then
+            category, pages = "", arg
+        else
+            category, pages = arg, nil
+        end
+    end
     category = category ~= "" and category or nil
-    ns.Scan:Start(ns.WatchlistFor(category), { category = category })
+    ns.Scan:Start(ns.WatchlistFor(category), { category = category, maxPages = tonumber(pages) })
 end
 
 -- /wowfah probe <item name or id> [pages]
@@ -271,12 +309,16 @@ function commands.clear(arg)
 end
 
 function commands.help()
-    ns.Print("/wowfah scan [category] | probe <item> [pages] | list | status | abort | clear")
+    ns.Print("/wowfah scan [category] [maxPages] | probe <item> [pages] | list | status | abort | clear")
+end
+
+function ns.RunCommand(cmd, arg)
+    local fn = commands[(cmd or ""):lower()] or commands.help
+    fn(arg or "")
 end
 
 SLASH_WOWFAH1 = "/wowfah"
 SlashCmdList.WOWFAH = function(msg)
     local cmd, arg = (msg or ""):match("^%s*(%S*)%s*(.-)%s*$")
-    local fn = commands[cmd:lower()] or commands.help
-    fn(arg)
+    ns.RunCommand(cmd, arg)
 end

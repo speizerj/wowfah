@@ -3,7 +3,8 @@
 --   { itemId, name, count, buyout, minBid, timeLeft, timeLeftSeconds, unreadable }
 -- Server behaviour knobs: listDelay, queryCooldown (throttle after each query),
 -- modernPageSize, nonCommodity[itemId], silentNames[name] (queries never answered),
--- duplicateAnswers (every result event fires twice).
+-- duplicateAnswers (every result event fires twice), brokenItems[itemId] (API calls for
+-- that item raise a Lua error, simulating a live client quirk the addon didn't expect).
 
 local M = {
     frames = {},
@@ -23,17 +24,54 @@ local M = {
     modernPageSize = 100,
     nonCommodity = {},
     silentNames = {},
+    brokenItems = {},
+    dropNext = {},
+    uncachedKeys = {},  -- itemId -> true: first search only fetches item info, like the live client
 }
+
+local function checkBroken(itemId)
+    if M.brokenItems[itemId] then
+        error("simulated client error for item " .. tostring(itemId), 0)
+    end
+end
 WOWMOCK = M
 
-function CreateFrame()
-    local f = { events = {}, scripts = {} }
-    function f:RegisterEvent(e) self.events[e] = true end
-    function f:UnregisterEvent(e) self.events[e] = nil end
-    function f:SetScript(name, fn) self.scripts[name] = fn end
+-- Frames and font strings: the methods the addon relies on behave; any other widget
+-- method (SetPoint, SetBackdrop, SetJustifyH, ...) is accepted and ignored.
+local function widget(kind)
+    local o = { kind = kind, events = {}, scripts = {}, shown = true, enabled = true }
+    function o:RegisterEvent(e) self.events[e] = true end
+    function o:UnregisterEvent(e) self.events[e] = nil end
+    function o:SetScript(name, fn) self.scripts[name] = fn end
+    function o:SetText(t) self.text = t end
+    function o:GetText() return self.text end
+    function o:SetEnabled(v) self.enabled = v and true or false end
+    function o:IsEnabled() return self.enabled end
+    function o:Show() self.shown = true end
+    function o:Hide() self.shown = false end
+    function o:IsShown() return self.shown end
+    function o:CreateFontString() return widget("FontString") end
+    function o:Click()
+        if self.enabled and self.scripts.OnClick then
+            self.scripts.OnClick(self, "LeftButton")
+        end
+    end
+    return setmetatable(o, { __index = function() return function() end end })
+end
+
+function CreateFrame(kind, name, parent)
+    local f = widget(kind)
+    f.parent = parent
+    if name then
+        _G[name] = f
+    end
     M.frames[#M.frames + 1] = f
     return f
 end
+
+UIParent = widget("Frame")
+M.reloads = 0
+function ReloadUI() M.reloads = M.reloads + 1 end
 
 function M.fire(event, ...)
     for _, f in ipairs(M.frames) do
@@ -107,6 +145,10 @@ local function answer(name, event, ...)
     if M.silentNames[name] then
         return
     end
+    if (M.dropNext[name] or 0) > 0 then  -- server loses this many queries, then answers
+        M.dropNext[name] = M.dropNext[name] - 1
+        return
+    end
     local args = { ... }
     C_Timer.After(M.listDelay, function() M.fire(event, (table.unpack or unpack)(args)) end)
     if M.duplicateAnswers then
@@ -149,6 +191,7 @@ function M.installClassic()
         if not a then
             return nil
         end
+        checkBroken(a.itemId)
         local itemId = (not a.unreadable) and a.itemId or nil
         return a.name, 136235, a.count, 1, true, 1, "", a.minBid, 0, a.buyout, 0, false, nil,
             "Seller", nil, 0, itemId, itemId ~= nil
@@ -160,6 +203,7 @@ function M.installClassic()
 end
 
 function M.installModern()
+    AuctionHouseFrame = CreateFrame("Frame", "AuctionHouseFrame")
     local loaded, rows = {}, {}
 
     local function commodityRows(itemId)
@@ -186,6 +230,11 @@ function M.installModern()
         SendSearchQuery = function(itemKey, sorts, separateOwnerItems)
             local itemId = itemKey.itemID
             sendQuery({ itemId = itemId, kind = "search" })
+            if M.uncachedKeys[itemId] then
+                M.uncachedKeys[itemId] = nil
+                C_Timer.After(0.01, function() M.fire("ITEM_KEY_ITEM_INFO_RECEIVED", itemId) end)
+                return
+            end
             local name = namesById(itemId)
             if M.nonCommodity[itemId] then
                 return answer(name, "ITEM_SEARCH_RESULTS_UPDATED", itemKey)
@@ -199,7 +248,17 @@ function M.installModern()
             loaded[itemId] = math.min(loaded[itemId] + M.modernPageSize, #rows[itemId])
             answer(namesById(itemId), "COMMODITY_SEARCH_RESULTS_ADDED", itemId)
         end,
-        GetNumCommoditySearchResults = function(itemId) return loaded[itemId] or 0 end,
+        GetCommoditySearchResultsQuantity = function(itemId)
+            local total = 0
+            for _, r in ipairs(rows[itemId] or {}) do
+                total = total + r.quantity
+            end
+            return total
+        end,
+        GetNumCommoditySearchResults = function(itemId)
+            checkBroken(itemId)
+            return loaded[itemId] or 0
+        end,
         HasFullCommoditySearchResults = function(itemId)
             return rows[itemId] ~= nil and loaded[itemId] >= #rows[itemId]
         end,

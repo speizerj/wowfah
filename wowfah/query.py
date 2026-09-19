@@ -60,7 +60,9 @@ def connect(
             s.item_id,
             s.name,
             s.started_at AS scanned_at,
+            s.capped,  -- true: stopped at a page cap before the whole market was read (quantity/median are a floor, not exact)
             s.reported_listings,
+            s.reported_quantity,
             s.listings_read,
             s.quantity,
             s.bid_only_quantity,

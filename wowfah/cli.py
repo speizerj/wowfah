@@ -18,20 +18,91 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _savedvariables(args: argparse.Namespace) -> Path:
+    from wowfah.sync import ENV_VAR, find_savedvariables
+
+    path = args.savedvariables or find_savedvariables()
+    if path is None:
+        raise SystemExit(f"couldn't find WoWFAH.lua; pass its path or set {ENV_VAR}")
+    return path
+
+
+def _report(results, data_dir: Path) -> None:
+    written = [r for r in results if r.status == "written"]
+    for r in written:
+        print(f"ingested {r.scan_id}: {r.items} items, {r.ladder_rows} ladder rows")
+    if not written:
+        print(f"nothing new ({len(results)} scan(s) already ingested)")
+        return
+    from wowfah.query import connect
+
+    con = connect(data_dir)
+    listed, total = con.execute("""
+        SELECT count(*) FILTER (WHERE quantity > 0), count(*) FROM item_scans
+        WHERE scan_id = (SELECT scan_id FROM scans ORDER BY started_at DESC LIMIT 1)
+    """).fetchone()
+    scans = con.execute("SELECT count(*) FROM scans").fetchone()[0]
+    print(f"latest scan: {listed}/{total} items listed; {scans} scan(s) in {data_dir}")
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    from wowfah.ingest import ingest_savedvariables
+
+    path = _savedvariables(args)
+    print(f"reading {path}")
+    _report(ingest_savedvariables(path, args.data_dir), args.data_dir)
+    return 0
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    from datetime import datetime
+
+    from wowfah.sync import watch
+
+    path = _savedvariables(args)
+    print(f"watching {path}\nclick Save & reload in game after a scan; Ctrl-C to stop")
+
+    def on_ingest(results):
+        print(f"[{datetime.now():%H:%M:%S}] ", end="")
+        _report(results, args.data_dir)
+
+    def on_error(exc):
+        print(f"[{datetime.now():%H:%M:%S}] couldn't read it yet ({exc}); retrying")
+
+    try:
+        watch(path, args.data_dir, on_ingest, on_error, interval=args.interval)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def cmd_probes(args: argparse.Namespace) -> int:
     from wowfah import savedvars
     from wowfah.ingest import DB_VARIABLE
 
-    db = savedvars.load(args.savedvariables).get(DB_VARIABLE) or {}
+    db = savedvars.load(_savedvariables(args)).get(DB_VARIABLE) or {}
     probes = db.get("probes") or []
     if isinstance(probes, dict):
         probes = []
-    if not probes:
-        print("no probe logs stored")
+    scans = db.get("scans") or []
+    if isinstance(scans, dict):
+        scans = []
+    if not probes and not scans:
+        print("no probe or scan logs stored")
         return 0
+    for s in scans:
+        items = s.get("items") or []
+        items = [] if isinstance(items, dict) else items
+        bad = sum(i.get("status") != "ok" for i in items)
+        print(f"== scan {s.get('scanId')} ({s.get('status')}): {s.get('itemsScanned')}/{s.get('itemsRequested')} "
+              f"item(s), {bad} not ok")
+        log = s.get("log") or []
+        for line in [] if isinstance(log, dict) else log:
+            print(line)
     for p in probes:
         print(f"== probe {p.get('target')} ({p.get('api')} API, {p.get('status')}): item {p.get('itemStatus')}, "
-              f"{p.get('pages')} page(s), {p.get('listingsRead')} read, reported {p.get('reportedListings')}")
+              f"{p.get('pages')} page(s), {p.get('listingsRead')} read ({p.get('quantity')} units), "
+              f"reported {p.get('reportedListings')}")
         log = p.get("log") or []
         for line in [] if isinstance(log, dict) else log:
             print(line)
@@ -186,6 +257,10 @@ def cmd_watchlist_export(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import signal
+
+    if hasattr(signal, "SIGPIPE"):  # `wowfah probes | head` shouldn't print a traceback
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     from wowfah import watchlist
 
     parser = argparse.ArgumentParser(prog="wowfah", description="WoW Forever auction house data pipeline")
@@ -197,8 +272,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--force", action="store_true", help="rewrite scans that were already ingested")
     p.set_defaults(func=cmd_ingest)
 
-    p = sub.add_parser("probes", help="print probe logs stored by /wowfah probe")
-    p.add_argument("savedvariables", type=Path)
+    for name, func, help_ in [
+        ("sync", cmd_sync, "find WoWFAH.lua and ingest any new scans"),
+        ("watch", cmd_watch, "ingest automatically every time the game saves WoWFAH.lua"),
+    ]:
+        p = sub.add_parser(name, help=help_)
+        p.add_argument("savedvariables", type=Path, nargs="?", help="default: found automatically")
+        p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+        if name == "watch":
+            p.add_argument("--interval", type=float, default=2.0, help="seconds between checks")
+        p.set_defaults(func=func)
+
+    p = sub.add_parser("probes", help="print scan and probe logs stored in SavedVariables")
+    p.add_argument("savedvariables", type=Path, nargs="?", help="default: found automatically")
     p.set_defaults(func=cmd_probes)
 
     p = sub.add_parser("dummy", help="write a fake SavedVariables file")

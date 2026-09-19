@@ -4,12 +4,25 @@ local Scan = {}
 ns.Scan = Scan
 
 local READY_POLL = 0.1            -- seconds between throttle checks
-local PAGE_TIMEOUT = 30           -- seconds to wait for one page of results
-local MAX_CONSECUTIVE_TIMEOUTS = 3
+local PAGE_TIMEOUT = 5            -- seconds to wait for an answer; live answers take well under 1s
+local MAX_RESENDS = 2             -- resend an unanswered query this many times before giving up on the item
+local MAX_LOG_LINES = 3000        -- scan logs are saved with the scan; cap so a long scan stays small
+local MAX_CONSECUTIVE_FAILURES = 3  -- timeouts and API errors both count
 local MAX_PAGES = 5000            -- per item; a safety stop, not an expected depth
 local PROBE_LINGER = 3            -- seconds a probe keeps listening for stray events
 local PROBE_ROWS = 5              -- raw rows dumped per probed page
 local MAX_PROBES = 5              -- probe logs kept in SavedVariables
+local MAX_SCANS = 10              -- scans kept in SavedVariables; ingest skips ones it already has
+
+-- Extra AH events scans and probes log (never act on), to see what the server sends when a
+-- query gets no result event -- e.g. dropped by the throttle, or answered some other way.
+local DIAGNOSTIC_EVENTS = {
+    "AUCTION_HOUSE_THROTTLED_MESSAGE_SENT", "AUCTION_HOUSE_THROTTLED_MESSAGE_QUEUED",
+    "AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED", "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED",
+    "AUCTION_HOUSE_THROTTLED_SYSTEM_READY", "AUCTION_HOUSE_SHOW_ERROR", "AUCTION_HOUSE_SHOW_NOTIFICATION",
+    "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", "AUCTION_HOUSE_BROWSE_RESULTS_ADDED", "ITEM_SEARCH_RESULTS_ADDED",
+    "AUCTION_HOUSE_BROWSE_FAILURE",
+}
 
 function Scan:IsRunning()
     return self.state ~= nil
@@ -37,7 +50,7 @@ end
 
 -- Appends a timestamped line to a probe's log; no-op for normal scans.
 function Scan:Log(st, fmt, ...)
-    if st.log then
+    if st.log and #st.log < MAX_LOG_LINES then
         st.log[#st.log + 1] = string.format("%8.3f  ", ns.Clock() - st.clock0) .. string.format(fmt, ...)
     end
 end
@@ -72,14 +85,28 @@ function Scan:Start(entries, opts)
         pagesDone = 0,
         okItems = 0,
         okPages = 0,
-        timeouts = 0,
+        failures = 0,
         seq = 0,
-        log = opts.probe and {} or nil,
+        resends = 0,
+        log = {},
     }
     self.state = st
     for _, event in ipairs(adapter.events) do
         ns.RegisterEvent(event, function(...)
             self:OnEvent(st, ...)
+        end)
+    end
+    for event in pairs(adapter.resendEvents or {}) do
+        pcall(ns.RegisterEvent, event, function(ev, arg)
+            self:OnResendEvent(st, ev, arg)
+        end)
+    end
+    for _, event in ipairs(DIAGNOSTIC_EVENTS) do
+        -- pcall: an event name this client doesn't know must not break the scan.
+        pcall(ns.RegisterEvent, event, function(ev, ...)
+            if self.state == st then
+                self:Log(st, "event %s(%s) [diagnostic]", ev, ns.Describe(...))
+            end
         end)
     end
 
@@ -103,6 +130,7 @@ function Scan:NextItem(st)
     if not entry then
         return self:Finish(st, "complete")
     end
+    st.resends = 0
     st.item = {
         entry = entry,
         startedAt = ns.Now(),
@@ -115,6 +143,7 @@ function Scan:NextItem(st)
         unreadable = 0,
     }
     self:Log(st, "item %s (id %s)", entry.name, tostring(entry.itemId))
+    ns.Notify()
     self:SendWhenReady(st)
 end
 
@@ -161,33 +190,66 @@ function Scan:OnEvent(st, event, ...)
         return
     end
     st.waiting = nil
+    st.resends = 0
     local item = st.item
-    if st.log then
+    if st.probe then
         for _, line in ipairs(st.adapter:DumpRows(item, event, PROBE_ROWS)) do
             self:Log(st, "  %s", line)
         end
     end
     local before = item.listingsRead
-    local hasMore, notCommodity = st.adapter:ReadPage(item, event)
+    -- ReadPage pokes at live AH API surface per item, so one item's quirk (a signature we
+    -- guessed wrong, an unexpected nil) shouldn't lose the rest of the scan. Whatever this
+    -- item already collected before the error stays; the scan moves on to the next item.
+    local ok, hasMore, notCommodity = pcall(function()
+        return st.adapter:ReadPage(item, event)
+    end)
+    if not ok then
+        self:Log(st, "ReadPage error: %s", tostring(hasMore))
+        st.failures = st.failures + 1
+        return self:FinishItem(st, "error")
+    end
     if notCommodity then
         self:Log(st, "not a commodity on this client")
         return self:FinishItem(st, "not_commodity")
     end
     item.pagesRead = item.pagesRead + 1
     st.pagesDone = st.pagesDone + 1
-    st.timeouts = 0
-    self:Log(st, "page read: %d listing(s), %d unreadable so far, reported total %s, more: %s",
-        item.listingsRead - before, item.unreadable, tostring(item.reportedListings), tostring(hasMore))
+    st.failures = 0
+    self:Log(st, "page read: %d listing(s), %d unit(s) read so far, %d unreadable, reported total %s, more: %s",
+        item.listingsRead - before, item.quantity, item.unreadable, tostring(item.reportedListings), tostring(hasMore))
     if hasMore and item.pagesRead < st.maxPages then
         return self:SendWhenReady(st)
     end
+    -- Stopped at the page cap with more still available: this item's ladder is a prefix of
+    -- the real market, not the whole thing. Flag it so the pipeline doesn't treat it as complete.
+    item.capped = item.capped or (hasMore and item.pagesRead >= st.maxPages)
     self:FinishItem(st, "ok")
+end
+
+-- The client swallowed the pending query (e.g. it only fetched item info); resend right away
+-- instead of waiting out the timeout. Doesn't count as a resend: nothing was lost.
+function Scan:OnResendEvent(st, event, arg)
+    if self.state ~= st then
+        return
+    end
+    local pending = st.waiting and st.item and arg == st.item.entry.itemId
+    self:Log(st, "event %s(%s)%s", event, tostring(arg), pending and ", resending now" or " [stray]")
+    if pending then
+        st.waiting = nil
+        self:SendWhenReady(st)
+    end
 end
 
 function Scan:OnTimeout(st)
     st.waiting = nil
-    st.timeouts = st.timeouts + 1
-    self:Log(st, "timed out after %ds", PAGE_TIMEOUT)
+    if st.resends < MAX_RESENDS then
+        st.resends = st.resends + 1
+        self:Log(st, "no answer after %ds, resending (%d/%d)", PAGE_TIMEOUT, st.resends, MAX_RESENDS)
+        return self:SendWhenReady(st)
+    end
+    st.failures = st.failures + 1
+    self:Log(st, "timed out after %d tries", MAX_RESENDS + 1)
     self:FinishItem(st, "timeout")
 end
 
@@ -214,7 +276,9 @@ function Scan:FinishItem(st, status)
     if status == "ok" then
         st.okItems = st.okItems + 1
         st.okPages = st.okPages + item.pagesRead
-        if not st.probe then
+        -- A capped item's page count is an artificial limit, not how long it actually takes
+        -- to read in full -- recording it would make future ETAs underestimate this item.
+        if not st.probe and not item.capped then
             ns.InitDB().itemStats[item.entry.itemId] = { pages = item.pagesRead, listings = item.listingsRead }
         end
     end
@@ -222,10 +286,12 @@ function Scan:FinishItem(st, status)
         itemId = item.entry.itemId,
         name = item.entry.name,
         status = status,
+        capped = item.capped or false,
         startedAt = item.startedAt,
         finishedAt = ns.Now(),
         pages = item.pagesRead,
         reportedListings = item.reportedListings,
+        reportedQuantity = item.reportedQuantity,
         listingsRead = item.listingsRead,
         quantity = item.quantity,
         bidOnlyListings = item.bidOnlyListings,
@@ -233,8 +299,9 @@ function Scan:FinishItem(st, status)
         unreadable = item.unreadable,
         ladder = packLadder(item.ladder),
     }
-    if st.timeouts >= MAX_CONSECUTIVE_TIMEOUTS then
-        return self:Abort("the server stopped answering searches")
+    if st.failures >= MAX_CONSECUTIVE_FAILURES then
+        return self:Abort("too many items in a row failed (timeouts or errors) -- something is probably wrong "
+            .. "with the adapter on this client; check probe logs")
     end
     self:NextItem(st)
 end
@@ -305,7 +372,14 @@ function Scan:Finish(st, status)
     for _, event in ipairs(st.adapter.events) do
         ns.UnregisterEvent(event)
     end
+    for event in pairs(st.adapter.resendEvents or {}) do
+        pcall(ns.UnregisterEvent, event)
+    end
+    for _, event in ipairs(DIAGNOSTIC_EVENTS) do
+        pcall(ns.UnregisterEvent, event)
+    end
     self.state = nil
+    ns.Notify()
     local db = ns.InitDB()
     local elapsed = ns.Clock() - st.clock0
 
@@ -335,10 +409,22 @@ function Scan:Finish(st, status)
         itemsScanned = #st.items,
         ladderFormat = ns.LADDER_FORMAT,
         items = st.items,
+        log = st.log,
     }
+    -- Keep SavedVariables small: the game reads and writes the whole file on every reload.
+    while #db.scans > MAX_SCANS do
+        table.remove(db.scans, 1)
+    end
+    for i = 1, #db.scans - 1 do
+        db.scans[i].log = nil
+    end
+    ns.unsavedScans = (ns.unsavedScans or 0) + 1
+    ns.lastResult = string.format("last scan %s: %d/%d items in %s", status, #st.items, #st.entries,
+        ns.FormatDuration(elapsed))
     ns.Print(string.format("scan %s: %d/%d item(s) stored (%d not ok), %d page(s) in %s%s; /reload or log out to save",
         status, #st.items, #st.entries, failed, st.pagesDone, ns.FormatDuration(elapsed),
         st.pagesDone > 0 and string.format(" (%.1fs/page)", elapsed / st.pagesDone) or ""))
+    ns.Notify()
 end
 
 function Scan:SaveProbe(st, db, status)
@@ -352,6 +438,7 @@ function Scan:SaveProbe(st, db, status)
         itemStatus = item and item.status,
         pages = item and item.pages,
         listingsRead = item and item.listingsRead,
+        quantity = item and item.quantity,
         reportedListings = item and item.reportedListings,
         log = st.log,
     })

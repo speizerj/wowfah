@@ -45,11 +45,13 @@ ITEM_SCANS_SCHEMA: dict[str, pl.DataType] = {
     "faction": pl.String(),
     "item_id": pl.Int64(),
     "name": pl.String(),
-    "status": pl.String(),  # "ok", "timeout", "not_commodity"
+    "status": pl.String(),  # "ok", "timeout", "not_commodity", "error"
+    "capped": pl.Boolean(),  # ok, but stopped at maxPages before the whole market was read
     "started_at": UTC_TS,
     "finished_at": UTC_TS,
     "pages": pl.Int32(),
     "reported_listings": pl.Int64(),  # total the server reported (classic); null when the API doesn't say
+    "reported_quantity": pl.Int64(),  # total units in the whole market (modern aggregate call)
     "listings_read": pl.Int64(),
     "quantity": pl.Int64(),  # units with a buyout
     "bid_only_listings": pl.Int64(),

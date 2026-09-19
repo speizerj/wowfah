@@ -123,22 +123,23 @@ def test_classic_reads_every_page_and_ignores_same_named_items():
     assert any("scan complete: 2/2" in m for m in client.messages)
 
 
-def test_modern_requests_more_until_full():
-    linen = listings_for(LINEN, 350)
-    client = open_client("modern", linen, [LINEN])
+def test_modern_one_query_per_item_with_total_depth():
+    # One search returns the market grouped into price tiers; the addon never pages. If the
+    # server holds rows back, the ladder is the cheap end and the total comes from the aggregate.
+    linen = listings_for(LINEN, 350)  # more buyout tiers than the mock returns per search
+    silk = listings_for(SILK, 20, seed=5)  # fits in one reply
+    client = open_client("modern", linen + silk, [LINEN, SILK])
     client.slash("scan")
     client.run_timers()
 
-    item = scan_items(client)[LINEN.item_id]
-    buyouts = [x for x in linen if x.buyout > 0]
-    assert item["status"] == "ok"
-    assert item["pages"] == -(-len(buyouts) // 100)
-    assert item["listingsRead"] == len(buyouts)
-    assert "reportedListings" not in item
-    assert decoded_ladder(item) == ladder_rows(linen, divisible=True)
+    items = scan_items(client)
+    li, si = items[LINEN.item_id], items[SILK.item_id]
+    assert li["pages"] == 1 and li["capped"] is True and li["listingsRead"] == 100
+    assert li["reportedQuantity"] == sum(x.count for x in linen if x.buyout > 0) > li["quantity"]
+    assert si["capped"] is False and si["reportedQuantity"] == si["quantity"]
+    assert decoded_ladder(si) == ladder_rows(silk, divisible=True)
     kinds = [q["kind"] for q in savedvars.lua_to_python(client.mock.queryLog)]
-    assert kinds == ["search"] + ["more"] * (item["pages"] - 1)
-    assert client.mock.throttleViolations == 0
+    assert kinds == ["search", "search"]
 
 
 def test_modern_marks_non_commodities():
@@ -213,7 +214,7 @@ def test_repeated_timeouts_abort_but_keep_finished_items():
     [scan] = client.db["scans"]
     assert scan["status"] == "aborted" and scan["itemsRequested"] == 5
     assert [i["status"] for i in scan["items"]] == ["ok", "timeout", "timeout", "timeout"]
-    assert any("stopped answering" in m for m in client.messages)
+    assert any("too many items in a row failed" in m for m in client.messages)
 
 
 def test_closing_auction_house_keeps_finished_items():
@@ -282,7 +283,8 @@ def test_old_schema_scans_are_discarded_on_load():
 def test_end_to_end_addon_to_market_view(flavor: str, tmp_path: Path):
     linen = listings_for(LINEN, 180)
     silk = listings_for(SILK, 40, seed=9)
-    client = open_client(flavor, linen + silk, [LINEN, SILK])
+    # modernPageSize: the live server returned whole beta markets in one reply
+    client = open_client(flavor, linen + silk, [LINEN, SILK], modernPageSize=10_000)
     client.slash("scan")
     client.run_timers()
 
@@ -327,7 +329,7 @@ def test_probe_logs_environment_pages_and_raw_rows(tmp_path: Path, capsys):
     assert "GetNumAuctionItems: 50, 260" in log
     assert '[1] "Linen Cloth", 136235, ' in log
     assert "answered after 0.200s" in log and "throttle cleared after" in log
-    assert "page read: 50 listing(s), 0 unreadable so far, reported total 260, more: true" in log
+    assert "page read: 50 listing(s), " in log and "unit(s) read so far, 0 unreadable, reported total 260, more: true" in log
     assert "[stray" not in log
     assert any("probe complete: ok, 2 page(s), 100 listing(s) read" in m for m in client.messages)
 
@@ -336,7 +338,7 @@ def test_probe_logs_environment_pages_and_raw_rows(tmp_path: Path, capsys):
     from wowfah.cli import main
     assert main(["probes", str(sv)]) == 0
     out = capsys.readouterr().out
-    assert "== probe Linen Cloth (classic API, complete): item ok, 2 page(s), 100 read, reported 260" in out
+    assert "== probe Linen Cloth (classic API, complete): item ok, 2 page(s), 100 read (" in out and "units), reported 260" in out
     assert "GetNumAuctionItems: 50, 260" in out
 
 
@@ -409,3 +411,210 @@ def test_format_duration():
     client.load_addon()
     fmt = client.ns.FormatDuration
     assert [fmt(4.4), fmt(59.6), fmt(125), fmt(3600 * 2 + 61)] == ["4s", "1m00s", "2m05s", "2h01m"]
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_scan_recovers_from_an_api_error_on_one_item(flavor: str):
+    # A live client can throw on a call signature the addon guessed wrong. One item's error
+    # shouldn't lose the rest of the scan -- see the pcall around ReadPage in Scan.lua.
+    client = open_client(flavor, listings_for(LINEN, 5) + listings_for(SILK, 5), [SILK, LINEN])
+    client.mock.brokenItems[SILK.item_id] = True
+    client.slash("scan")
+    client.run_timers()
+    [scan] = client.db["scans"]
+    assert scan["status"] == "complete"
+    items = scan_items(client)
+    assert items[SILK.item_id]["status"] == "error"
+    assert items[LINEN.item_id]["status"] == "ok"
+    assert any("ReadPage error:" in m for m in client.messages) is False  # only in probe logs, not chat
+
+
+def test_probe_survives_a_broken_diagnostic_call():
+    # GetItemCommodityStatus threw on a real beta client for a valid item id (bad argument #1);
+    # the probe must log that and keep going, not crash the whole event handler.
+    client = open_client("modern", listings_for(LINEN, 5), [LINEN])
+
+    def broken(item_id):
+        raise ValueError("bad argument #1 to 'GetItemCommodityStatus'")
+
+    client.mock.brokenItems[LINEN.item_id] = False  # ReadPage itself must still work
+    client.lua.globals().C_AuctionHouse.GetItemCommodityStatus = client.lua.eval(
+        "function(f) return function(...) return f(...) end end")(broken)
+    client.slash("probe Linen Cloth")
+    client.run_timers()
+
+    log = "\n".join(probe_log(client))
+    assert "GetItemCommodityStatus: ERROR:" in log and "bad argument" in log
+    item = client.db["probes"][0]
+    assert item["itemStatus"] == "ok" and item["listingsRead"] == 5  # ReadPage still ran fine
+
+
+def test_repeated_errors_abort_like_repeated_timeouts():
+    entries = [LINEN, SILK, CATALOG[2], CATALOG[3]]
+    # Each broken item needs its own listings, or Classic's read loop (where checkBroken
+    # fires) never runs for it -- an empty market for that item just reads as zero rows.
+    auctions = [li for e in entries for li in listings_for(e, 5, seed=e.item_id)]
+    client = open_client("classic", auctions, entries)
+    for item in entries[1:]:
+        client.mock.brokenItems[item.item_id] = True
+    client.slash("scan")
+    client.run_timers()
+    [scan] = client.db["scans"]
+    assert scan["status"] == "aborted"
+    assert [i["status"] for i in scan["items"]] == ["ok", "error", "error", "error"]
+
+
+def test_scan_maxpages_arg_caps_and_flags_capped_items():
+    flavor = "classic"  # modern never pages, so maxPages only matters here
+    # A market with many price tiers (many pages) gets cut off; a small one finishes naturally
+    # within the cap regardless. Both are status "ok", only the big one is capped.
+    big = listings_for(LINEN, 400)  # several pages
+    small = listings_for(SILK, 10, seed=11)  # fits in one page
+    client = open_client(flavor, big + small, [LINEN, SILK])
+    client.slash("scan 2")
+    client.run_timers()
+
+    items = scan_items(client)
+    assert items[LINEN.item_id]["status"] == "ok" and items[LINEN.item_id]["capped"] is True
+    assert items[LINEN.item_id]["pages"] == 2
+    assert items[SILK.item_id]["status"] == "ok" and items[SILK.item_id]["capped"] is False
+
+    # Capped items' page counts shouldn't poison future ETA estimates.
+    stats = client.db["itemStats"]
+    assert LINEN.item_id not in stats
+    assert stats[SILK.item_id]["pages"] == items[SILK.item_id]["pages"]
+
+
+def test_scan_arg_parsing_category_and_pages():
+    client = open_client("classic", listings_for(LINEN, 3) + listings_for(LOTUS, 3), [LINEN, LOTUS])
+    client.slash("scan herb 1")
+    client.run_timers()
+    [scan] = client.db["scans"]
+    assert scan["category"] == "herb"
+    items = scan_items(client)
+    assert set(items) == {LOTUS.item_id}
+    assert items[LOTUS.item_id]["pages"] == 1
+
+
+def test_end_to_end_capped_item_reaches_item_scans(tmp_path: Path):
+    client = open_client("classic", listings_for(LINEN, 300), [LINEN])
+    client.slash("scan 1")
+    client.run_timers()
+
+    sv = tmp_path / "WoWFAH.lua"
+    savedvars.dump({"WoWFAH_DB": client.db}, sv)
+    ingest_savedvariables(sv, tmp_path / "data")
+
+    df = pl.read_parquet(tmp_path / "data" / "item_scans" / "*.parquet")
+    assert df.row(0, named=True)["capped"] is True
+
+
+def test_probe_logs_diagnostic_ah_events():
+    client = open_client("modern", listings_for(LINEN, 5), [LINEN])
+    client.mock.silentNames["Linen Cloth"] = True  # the result event never comes...
+    client.slash("probe Linen Cloth 1")
+    client.fire("AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED")  # ...because the server dropped it
+    client.run_timers()
+    log = "\n".join(probe_log(client))
+    assert "event AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED() [diagnostic]" in log
+    assert "no answer after 5s, resending (1/2)" in log and "timed out after 3 tries" in log
+    # Diagnostic handlers are gone once the probe finishes.
+    n = len(probe_log(client))
+    client.fire("AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED")
+    assert len(probe_log(client)) == n
+
+
+@pytest.mark.parametrize("flavor", FLAVORS)
+def test_lost_query_is_resent_and_scan_logs_it(flavor: str):
+    client = open_client(flavor, listings_for(LINEN, 5), [LINEN])
+    client.mock.dropNext["Linen Cloth"] = 1  # first query lost, the resend is answered
+    client.slash("scan")
+    client.run_timers()
+    [scan] = client.db["scans"]
+    assert scan["status"] == "complete"
+    assert scan_items(client)[LINEN.item_id]["status"] == "ok"
+    log = "\n".join(scan["log"])
+    assert "no answer after 5s, resending (1/2)" in log
+    assert "answered after" in log
+    assert "GetNumCommoditySearchResults" not in log and "GetNumAuctionItems" not in log  # no row dumps in scans
+
+
+def test_cli_probes_prints_scan_logs(tmp_path: Path, capsys):
+    client = open_client("modern", listings_for(LINEN, 5), [LINEN])
+    client.slash("scan")
+    client.run_timers()
+    sv = tmp_path / "WoWFAH.lua"
+    savedvars.dump({"WoWFAH_DB": client.db}, sv)
+    from wowfah.cli import main
+    assert main(["probes", str(sv)]) == 0
+    out = capsys.readouterr().out
+    assert "== scan Dreamscythe-Alliance-" in out and "(complete): 1/1 item(s), 0 not ok" in out
+    assert "query page 0" in out
+
+
+def test_uncached_item_is_resent_as_soon_as_its_info_arrives():
+    # Live beta: a search for an item the client hasn't cached only fetches its info and the
+    # search is dropped. The scan must resend on ITEM_KEY_ITEM_INFO_RECEIVED, not wait 5s.
+    client = open_client("modern", listings_for(LINEN, 5) + listings_for(SILK, 5, seed=2), [LINEN, SILK])
+    client.mock.uncachedKeys[LINEN.item_id] = True
+    client.mock.uncachedKeys[SILK.item_id] = True
+    client.slash("scan")
+    client.run_timers()
+
+    [scan] = client.db["scans"]
+    assert scan["status"] == "complete"
+    assert all(i["status"] == "ok" for i in scan["items"])
+    log = "\n".join(scan["log"])
+    assert log.count("ITEM_KEY_ITEM_INFO_RECEIVED") == 2 and "resending now" in log
+    assert "no answer after" not in log
+    assert scan["finishedAt"] - scan["startedAt"] < 5
+
+
+def panel(client):
+    return client.ns.UI
+
+
+def click(button):
+    button.Click(button)
+
+
+def test_panel_appears_on_the_ah_and_scans_with_a_click():
+    client = open_client("modern", listings_for(LINEN, 5), [LINEN])
+    ui = panel(client)
+    assert client.lua.eval("function(ui) return ui.frame.parent == AuctionHouseFrame end")(ui)
+    assert ui.scan.enabled and not ui.abort.enabled
+    assert "ready" in ui.status.text
+
+    click(ui.scan)
+    assert not ui.scan.enabled and ui.abort.enabled
+    assert "scan running: item 1/1 Linen Cloth" in ui.status.text
+    client.run_timers()
+
+    assert ui.scan.enabled and not ui.abort.enabled
+    assert "last scan complete: 1/1 items" in ui.status.text
+    assert "1 scan(s) not saved yet" in ui.status.text
+    click(ui.save)
+    assert client.mock.reloads == 1
+
+
+def test_panel_abort_button_and_disabled_scan_when_ah_closed():
+    client = open_client("modern", listings_for(LINEN, 5) + listings_for(SILK, 5, seed=2), [LINEN, SILK],
+                         listDelay=1.0)
+    ui = panel(client)
+    click(ui.scan)
+    click(ui.abort)
+    client.run_timers()
+    assert any("aborted by user" in m for m in client.messages)
+    client.fire("AUCTION_HOUSE_CLOSED")
+    assert not ui.scan.enabled
+
+
+def test_old_scans_are_pruned_and_only_the_newest_keeps_its_log():
+    client = open_client("modern", listings_for(LINEN, 3), [LINEN])
+    for _ in range(12):
+        client.slash("scan")
+        client.run_timers()
+        client.mock.now += 60  # distinct scan ids
+    scans = client.db["scans"]
+    assert len(scans) == 10
+    assert all("log" not in s for s in scans[:-1]) and scans[-1]["log"]

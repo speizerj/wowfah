@@ -8,12 +8,22 @@ Manual, full-depth auction house scans of a commodity watchlist from WoW Forever
 
 ## Addon
 
-Copy `addon/WoWFAH` into `Interface/AddOns/`, then at the auction house run:
+Copy (or symlink) `addon/WoWFAH` into `Interface/AddOns/`. Opening the auction house shows a small WoWFAH panel next to it:
+
+- **Scan**: scan the whole watchlist.
+- **Abort**: stop a running scan.
+- **Save & reload**: write the scans to disk (`/reload`), so `wowfah watch` picks them up.
+- A status line with progress and time left, and a reminder when a scan hasn't been saved yet.
+
+Keep `wowfah watch` running on your computer and the loop is: **Scan**, then **Save & reload**. The addon keeps the last 10 scans and only the newest scan's log, so there's no need to clear anything by hand.
+
+Everything is also available as slash commands:
 
 | Command | Effect |
 | --- | --- |
 | `/wowfah scan` | scan every watched item at full depth (needs the AH window open) |
 | `/wowfah scan <category>` | scan one category, e.g. `/wowfah scan herb` |
+| `/wowfah scan [category] <maxPages>` | cap pages per item, e.g. `/wowfah scan cloth 3` or `/wowfah scan 3` for everything -- a market with many price tiers, or a slow/throttled server, can otherwise page for a long time per item |
 | `/wowfah probe <item> [pages]` | instrumented scan of one item (default 3 pages) that saves a diagnostic log instead of a scan |
 | `/wowfah list` | watched item counts per category |
 | `/wowfah status` | stored scans, plus progress and time left for a running scan |
@@ -26,11 +36,13 @@ Data is written to disk on `/reload` or logout:
 The addon picks its API at runtime:
 
 - **Classic** (`QueryAuctionItems`): searches the exact item name, reads every 50-auction page, and keeps only rows whose item id matches. Some items share a name, e.g. Dark Iron Ore. It waits for `CanSendAuctionQuery` before each page. The server's total listing count is stored as `reportedListings`.
-- **Modern** (`C_AuctionHouse`): commodity search, then `RequestMoreCommoditySearchResults` until the results are complete. Items that the client doesn't treat as commodities are stored with status `not_commodity`.
+- **Modern** (`C_AuctionHouse`, what WoW Forever uses): one commodity search per item, no paging. The server returns the market already grouped into price tiers, cheapest first, and `GetCommoditySearchResultsQuantity` gives total units, stored as `reportedQuantity`. If the server holds back rows (`HasFullCommoditySearchResults` false), the item is flagged `capped` and the ladder covers only the cheap end. `maxPages` doesn't apply here. Items that the client doesn't treat as commodities are stored with status `not_commodity`.
 
-If a page gets no answer within 30s, that item is marked `timeout` and the scan moves on. Three timeouts in a row abort the scan. Closing the AH also aborts it, and in both cases the finished items are kept.
+Live answers take well under a second, so if a query gets no answer within 5s it is resent, up to twice. After 3 unanswered tries the item is marked `timeout` and the scan moves on. If the client throws on an API call for an item (a live client behaving differently than the adapter expects), that item is marked `error` and the scan moves on too, keeping whatever it already collected for that item. Three timeouts or errors in a row (in any mix) abort the scan. Closing the AH also aborts it, and in every case the finished items are kept.
 
-**Time estimates.** After each scan the addon remembers every item's page count and the average seconds per page. `/wowfah scan` prints a rough duration once every item has history. `/wowfah status` shows the current page against the expected total, elapsed time, and time left. The estimate uses the server's reported total for the current item and last scan's page counts for the rest.
+**Time estimates.** After each scan the addon remembers every item's page count and the average seconds per page. `/wowfah scan` prints a rough duration once every item has history. `/wowfah status` shows the current page against the expected total, elapsed time, and time left. The estimate uses the server's reported total for the current item and last scan's page counts for the rest. A page-capped item's count isn't remembered for this, since it isn't how long the item actually takes to read in full.
+
+**Capped items.** If `maxPages` cuts an item off before its market finished, it's still stored with `status = "ok"` (this wasn't a failure) but `capped = true`. Since results come back cheapest-first, `min_unit_price` and the cheap end of the ladder are still accurate -- what's understated is `quantity` and anything computed from the far/expensive end, like `median_unit_price`. Check `item_scans.capped` before trusting those for a given scan.
 
 **Probes.** `/wowfah probe Peacebloom` logs:
 - the client build, region, and which API functions exist
@@ -38,7 +50,7 @@ If a page gets no answer within 30s, that item is marked `timeout` and the scan 
 - every event with its arguments, including duplicate or late events, which are flagged `[stray]`
 - raw return values for the first rows of each page
 
-It keeps listening 3s after the last page to catch late events. The last 5 probe logs are kept. Print them with `wowfah probes path/to/WoWFAH.lua`.
+It keeps listening 3s after the last page to catch late events. The last 5 probe logs are kept. Scans keep the same event log (without the raw row dumps), saved with each scan. Print both with `wowfah probes path/to/WoWFAH.lua`.
 
 For each item, the stored ladder holds one row per `(unit price, stack size, time left)` with listing and unit counts. Bid-only auctions are counted separately. The `## Interface` number in the `.toc` is a placeholder until the client build is known.
 
@@ -50,9 +62,11 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 wowfah items import                          # download Classic Era item data from wago.tools -> data/items/
 wowfah watchlist check                       # validate watchlist.csv ids and names against item data
 wowfah watchlist export                      # write addon/WoWFAH/Watchlist.lua
+wowfah watch                                 # leave running: ingests every time the game saves WoWFAH.lua
+wowfah sync                                  # or ingest once (WoWFAH.lua is found automatically; override with $WOWFAH_SV)
 wowfah ingest path/to/WoWFAH.lua             # -> data/{scans,item_scans,ladder}/*.parquet
 wowfah sql "SELECT * FROM market LIMIT 20"
-wowfah probes path/to/WoWFAH.lua             # print /wowfah probe logs
+wowfah probes                                # print scan and probe logs
 wowfah signals                               # BUY/SELL at the latest scan of each item
 wowfah backtest                              # forward returns + trade simulation over all scans
 wowfah simulate data-sim --seed 3            # synthetic launch economy to try signals on
@@ -66,7 +80,7 @@ Ingest is idempotent: a scan that is already in `data/scans/` is skipped unless 
 DuckDB views:
 
 - `scans`: one row per scan (API, category filter, `complete`/`aborted`, timing, item counts).
-- `item_scans`: one row per watched item per scan: status, pages, listings read against listings reported, units, bid-only units.
+- `item_scans`: one row per watched item per scan: status, `capped` (page-limited before the market finished), pages, listings read against listings reported, units, bid-only units.
 - `ladder`: raw price ladder rows. Money is copper per unit. `stack_size` 0 means partial buys are allowed (modern commodities).
 - `market`: per scan and item, `ok` items only. Units, min price, quantity-weighted p10/p25/median, and expiring against very-long units.
 - `buy_price(n)`: average and max unit price to buy the cheapest `n` units. It treats stacks as divisible.
@@ -155,7 +169,8 @@ It also fails if `Watchlist.lua` is out of date with `watchlist.csv`.
 
 Run `/wowfah probe Peacebloom 5`, then `/reload`, then `wowfah probes WoWFAH.lua`. That log answers most of these:
 
-- `.toc` Interface number, and which API flavor the client exposes.
-- Classic: real query delay, pages per item, and whether stray `AUCTION_ITEM_LIST_UPDATE` events cause a page to be read twice. Compare `listings_read` with `reported_listings`.
-- Modern: whether result indexes are 1-based, and whether `timeLeftSeconds` is filled in.
-- How long a full watchlist scan takes. Split by category if it's too slow.
+- `.toc` Interface number, and which API flavor the client exposes. **Confirmed 2026-09-18**: modern (`C_AuctionHouse`), Interface 16001, `WOW_PROJECT_ID=1`, row shape and 1-based indexing match what the adapter already assumed.
+- Classic: real query delay, pages per item, and whether stray `AUCTION_ITEM_LIST_UPDATE` events cause a page to be read twice. Compare `listings_read` with `reported_listings`. (Moot unless a ruleset turns out to use Classic instead.)
+- Modern: whether result indexes are 1-based, and whether `timeLeftSeconds` is filled in. **Confirmed**: both yes.
+- How long a full watchlist scan takes. Split by category if it's too slow, or cap pages with `/wowfah scan [category] maxPages`. A real cloth-category scan against a beta server (EU→US) saw ~35s/page -- close enough to `PAGE_TIMEOUT` (30s) that some of that may be timeouts rather than genuine round-trip latency; worth checking `item_scans.status` for `timeout` after a slow scan rather than assuming it's all latency.
+- Whether `GetCommoditySearchResultsQuantity`/`GetMaxCommoditySearchResultPrice` give accurate total-depth/max-price in one call without paging to completion -- `/wowfah probe` now logs both (unverified against a live client as of 2026-09-18). If they check out, `Modern:ReadPage` could stop walking every page for a market's full depth: read a bounded prefix for the price ladder, and take total quantity straight from that one call.

@@ -9,6 +9,8 @@ local _, ns = ...
 --   ReadPage(item, event)          -> hasMore, notCommodity
 --   DumpRows(item, event, limit)   -> raw API return values as strings, for probe logs
 --   pageSize                       -> listings per page when the API pages by count, else nil
+--   resendEvents                   -> optional {event = true}: the pending query was swallowed and
+--                                     should be resent now; the event's first arg is the item id
 -- ReadPage records results with ns.AddListing / ns.AddBidOnly and may set
 -- item.reportedListings (total the server says exists) and item.unreadable.
 ns.adapters = {}
@@ -61,8 +63,8 @@ function Classic:DumpRows(_, _, limit)
     local batch, total = GetNumAuctionItems("list")
     local lines = { "GetNumAuctionItems: " .. ns.Describe(batch, total) }
     for i = 1, math.min(limit, batch or 0) do
-        lines[#lines + 1] = string.format("[%d] %s | timeLeft=%s", i, ns.Describe(GetAuctionItemInfo("list", i)),
-            tostring(GetAuctionItemTimeLeft("list", i)))
+        lines[#lines + 1] = string.format("[%d] %s | timeLeft=%s", i,
+            ns.TryDescribe(GetAuctionItemInfo, "list", i), ns.TryDescribe(GetAuctionItemTimeLeft, "list", i))
     end
     return lines
 end
@@ -71,6 +73,9 @@ end
 local Modern = {
     name = "modern",
     events = { "COMMODITY_SEARCH_RESULTS_UPDATED", "COMMODITY_SEARCH_RESULTS_ADDED", "ITEM_SEARCH_RESULTS_UPDATED" },
+    -- Searching an item the client hasn't cached yet only fetches its info; the search itself
+    -- is dropped. Seen live on the Forever beta: resending once the info arrives works at once.
+    resendEvents = { ITEM_KEY_ITEM_INFO_RECEIVED = true },
 }
 ns.adapters.modern = Modern
 
@@ -131,23 +136,39 @@ function Modern:ReadPage(item, event)
         end
     end
     item.read = n
-    -- Stop if a request for more returned nothing new, so a stuck server can't loop forever.
-    local progressed = n > before or item.pagesRead == 0
-    return progressed and not C_AuctionHouse.HasFullCommoditySearchResults(itemId), false
+    -- One search returns the market already grouped into price tiers, cheapest first, and
+    -- the aggregate call gives total depth -- so never page. If the server held rows back,
+    -- the ladder is the cheap end only; flag it, total units still come from the aggregate.
+    local okQty, total = pcall(C_AuctionHouse.GetCommoditySearchResultsQuantity, itemId)
+    item.reportedQuantity = okQty and total or nil
+    item.capped = not C_AuctionHouse.HasFullCommoditySearchResults(itemId)
+    return false, false
 end
 
 function Modern:DumpRows(item, event, limit)
     local itemId = item.entry.itemId
     local lines = {}
     if C_AuctionHouse.GetItemCommodityStatus then
-        lines[1] = "GetItemCommodityStatus: " .. ns.Describe(C_AuctionHouse.GetItemCommodityStatus(itemId))
+        lines[1] = "GetItemCommodityStatus: " .. ns.TryDescribe(C_AuctionHouse.GetItemCommodityStatus, itemId)
     end
     if event == "ITEM_SEARCH_RESULTS_UPDATED" then
         return lines
     end
-    local n = C_AuctionHouse.GetNumCommoditySearchResults(itemId) or 0
-    lines[#lines + 1] = string.format("GetNumCommoditySearchResults: %d, HasFull: %s", n,
-        tostring(C_AuctionHouse.HasFullCommoditySearchResults(itemId)))
+    local ok, n = pcall(C_AuctionHouse.GetNumCommoditySearchResults, itemId)
+    n = (ok and n) or 0
+    lines[#lines + 1] = string.format("GetNumCommoditySearchResults: %s, HasFull: %s",
+        ok and tostring(n) or "ERROR", ns.TryDescribe(C_AuctionHouse.HasFullCommoditySearchResults, itemId))
+    -- These claim to give total depth/max price without walking every page -- unverified
+    -- against a live client yet. If they check out, ReadPage can use them instead of paging
+    -- to completion for every item (see Modern:ReadPage TODO).
+    if C_AuctionHouse.GetCommoditySearchResultsQuantity then
+        lines[#lines + 1] = "GetCommoditySearchResultsQuantity: " ..
+            ns.TryDescribe(C_AuctionHouse.GetCommoditySearchResultsQuantity, itemId)
+    end
+    if C_AuctionHouse.GetMaxCommoditySearchResultPrice then
+        lines[#lines + 1] = "GetMaxCommoditySearchResultPrice: " ..
+            ns.TryDescribe(C_AuctionHouse.GetMaxCommoditySearchResultPrice, itemId)
+    end
     -- The new rows, plus index 0 and n + 1, which show whether results are 0- or 1-based.
     local first = (item.read or 0) + 1
     local indexes = { 0 }
@@ -156,7 +177,8 @@ function Modern:DumpRows(item, event, limit)
     end
     indexes[#indexes + 1] = n + 1
     for _, i in ipairs(indexes) do
-        lines[#lines + 1] = string.format("[%d] %s", i, ns.Describe(C_AuctionHouse.GetCommoditySearchResultInfo(itemId, i)))
+        lines[#lines + 1] = string.format("[%d] %s", i,
+            ns.TryDescribe(C_AuctionHouse.GetCommoditySearchResultInfo, itemId, i))
     end
     return lines
 end

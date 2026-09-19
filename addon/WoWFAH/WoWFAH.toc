@@ -1,14 +1,15 @@
-## Interface: 11507
+## Interface: 16001
 ## Title: WoWFAH
 ## Notes: Manual full-depth auction house scans of a commodity watchlist, for offline analysis
 ## Author: Jordan Speizer
 ## Version: 0.2.0
 ## SavedVariables: WoWFAH_DB
 
-# The Interface number is a placeholder until the WoW Forever client build is known.
-# If the client reports the addon as out of date, update it (or tick "Load out of date AddOns").
+# Interface 16001 confirmed via /wowfah probe against WoW Forever beta build 1.60.1 (69913),
+# 2026-09-18. WOW_PROJECT_ID=1 (Mainline) on this client, using the modern C_AuctionHouse API.
 
 Core.lua
 Watchlist.lua
 Adapters.lua
 Scan.lua
+UI.lua
